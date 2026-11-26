@@ -11,13 +11,17 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <getopt.h>
+#include <math.h>
 #include <regex.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -31,6 +35,8 @@ typedef struct {
     int comma;
     int use_filter;
     regex_t filter;
+    int watch;
+    struct timespec interval;
 } cli_opts_t;
 
 typedef enum {
@@ -195,17 +201,17 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
     return 0;
 }
 
-static void print_pid(pid_t pid, int comma, int *printed) {
+static void print_pid(FILE *out, pid_t pid, int comma, int *printed) {
     if (comma) {
         if (*printed) {
-            printf(",");
+            fprintf(out, ",");
         }
-        printf("%d", (int)pid);
+        fprintf(out, "%d", (int)pid);
         *printed = 1;
         return;
     }
 
-    printf("%d\n", (int)pid);
+    fprintf(out, "%d\n", (int)pid);
 }
 
 /*
@@ -213,7 +219,7 @@ static void print_pid(pid_t pid, int comma, int *printed) {
  * proc table for children of the current frontier. O(n^2) worst case,
  * which is trivial for realistic process counts (a few thousand).
  */
-static int print_trees(proc_t *procs, size_t n, int comma) {
+static int print_trees(FILE *out, proc_t *procs, size_t n, int comma) {
     pid_t *queue = malloc(n * sizeof(*queue));
     if (!queue) {
         return -1;
@@ -225,7 +231,7 @@ static int print_trees(proc_t *procs, size_t n, int comma) {
     for (size_t i = 0; i < n; i++) {
         if (procs[i].selected) {
             queue[tail++] = procs[i].pid;
-            print_pid(procs[i].pid, comma, &printed);
+            print_pid(out, procs[i].pid, comma, &printed);
         }
     }
 
@@ -234,13 +240,13 @@ static int print_trees(proc_t *procs, size_t n, int comma) {
         for (size_t i = 0; i < n; i++) {
             if (!procs[i].selected && procs[i].ppid == cur) {
                 procs[i].selected = 1;
-                print_pid(procs[i].pid, comma, &printed);
+                print_pid(out, procs[i].pid, comma, &printed);
                 queue[tail++] = procs[i].pid;
             }
         }
     }
     if (comma) {
-        printf("\n");
+        fprintf(out, "\n");
     }
     free(queue);
     return 0;
@@ -248,13 +254,15 @@ static int print_trees(proc_t *procs, size_t n, int comma) {
 
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
 static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
-    *inputs = (cli_opts_t){0};
+    *inputs = (cli_opts_t){.interval = {.tv_sec = 5}};
     const char *pid_arg = NULL;
     const char *pattern = NULL;
+    const char *interval_arg = NULL;
     static const struct option options[] = {
         {"comma", no_argument, NULL, 'c'},
         {"pid", required_argument, NULL, 'p'},
         {"filter", required_argument, NULL, 'f'},
+        {"watch", optional_argument, NULL, 'w'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -264,6 +272,13 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
         case 'c': inputs->comma = 1; break;
         case 'p': pid_arg = optarg; break;
         case 'f': pattern = optarg; break;
+        case 'w':
+            inputs->watch = 1;
+            interval_arg = optarg;
+            if (!interval_arg && optind < argc && argv[optind][0] != '-') {
+                interval_arg = argv[optind++];
+            }
+            break;
         case 'h':
             printf("usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n"
                    "\n"
@@ -273,6 +288,7 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
                    "  -c, --comma             Separate PIDs with commas instead of newlines.\n"
                    "  -p, --pid <pid>         Select a root process by PID.\n"
                    "  -f, --filter <pattern>  Match full command lines using an extended regex.\n"
+                   "      --watch [interval]  Refresh every interval seconds (default: 5; Ctrl-C to stop).\n"
                    "  -h, --help              Display this help and exit.\n",
                    argv[0]);
             return PARSE_HELP;
@@ -282,6 +298,19 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     if (optind != argc || (!pid_arg && !pattern) || (pid_arg && pattern)) {
         fprintf(stderr, "usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n", argv[0]);
         return PARSE_ERROR;
+    }
+
+    if (interval_arg) {
+        char *end;
+        errno = 0;
+        double seconds = strtod(interval_arg, &end);
+        if (errno != 0 || end == interval_arg || *end != '\0' ||
+            !isfinite(seconds) || seconds < 1e-9 || seconds > INT32_MAX) {
+            fprintf(stderr, "invalid watch interval: %s\n", interval_arg);
+            return PARSE_ERROR;
+        }
+        inputs->interval.tv_sec = (time_t)seconds;
+        inputs->interval.tv_nsec = (long)((seconds - (double)inputs->interval.tv_sec) * 1e9);
     }
 
     if (pattern) {
@@ -305,23 +334,11 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     return PARSE_OK;
 }
 
-int main(int argc, char **argv) {
-    cli_opts_t inputs;
-    parse_result_t parsed = parse_opts(argc, argv, &inputs);
-    if (parsed == PARSE_HELP) {
-        return 0;
-    }
-    if (parsed == PARSE_ERROR) {
-        return 2;
-    }
-
+static int print_snapshot(const cli_opts_t *inputs, FILE *out) {
     proc_t *procs;
     size_t n;
-    int result = collect_procs(&procs, &n, inputs.root,
-                               inputs.use_filter ? &inputs.filter : NULL);
-    if (inputs.use_filter) {
-        regfree(&inputs.filter);
-    }
+    int result = collect_procs(&procs, &n, inputs->root,
+                              inputs->use_filter ? &inputs->filter : NULL);
     if (result != 0) {
         perror("collect_procs");
         return 1;
@@ -335,17 +352,116 @@ int main(int argc, char **argv) {
         }
     }
     if (!found) {
-        if (!inputs.use_filter) {
-            fprintf(stderr, "pid %d not found\n", (int)inputs.root);
+        if (!inputs->watch && !inputs->use_filter) {
+            fprintf(stderr, "pid %d not found\n", (int)inputs->root);
         }
         free(procs);
-        return 1;
+        return inputs->watch ? 0 : 1;
     }
 
-    result = print_trees(procs, n, inputs.comma);
+    result = print_trees(out, procs, n, inputs->comma);
     if (result != 0) {
         perror("print_trees");
     }
     free(procs);
     return result != 0 ? 1 : 0;
+}
+
+/* Bound each frame to the current terminal size so refreshes never scroll. */
+static void redraw(const char *frame) {
+    struct winsize size = {0};
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &size);
+    int rows = size.ws_row ? size.ws_row : 24;
+    int cols = size.ws_col ? size.ws_col : 80;
+    int row = 0, col = 0;
+
+    printf("\033[H\033[J");
+    for (; *frame && row < rows; frame++) {
+        if (*frame == '\n') {
+            row++;
+            if (row < rows) {
+                putchar('\n');
+            }
+            col = 0;
+        } else {
+            if (col == cols) {
+                row++;
+                if (row == rows) {
+                    break;
+                }
+                putchar('\n');
+                col = 0;
+            }
+            putchar(*frame);
+            col++;
+        }
+    }
+}
+
+static int refresh(const cli_opts_t *inputs, int terminal) {
+    if (!terminal) {
+        return print_snapshot(inputs, stdout);
+    }
+
+    char *frame = NULL;
+    size_t size = 0;
+    FILE *out = open_memstream(&frame, &size);
+    if (!out) {
+        perror("open_memstream");
+        return 1;
+    }
+    int result = print_snapshot(inputs, out);
+    if (fclose(out) != 0) {
+        perror("fclose");
+        result = 1;
+    }
+    if (result == 0) {
+        redraw(frame);
+    }
+    free(frame);
+    return result;
+}
+
+int main(int argc, char **argv) {
+    cli_opts_t inputs;
+    parse_result_t parsed = parse_opts(argc, argv, &inputs);
+    if (parsed == PARSE_HELP) {
+        return 0;
+    }
+    if (parsed == PARSE_ERROR) {
+        return 2;
+    }
+
+    /* Send each frame in one write instead of one per line, so a terminal
+     * never shows a refresh partly drawn. glibc ignores the size unless it is
+     * given storage, and stdio still flushes that storage at exit. */
+    static char output[1 << 16];
+    setvbuf(stdout, output, _IOFBF, sizeof(output));
+
+    int terminal = inputs.watch && isatty(STDOUT_FILENO);
+    int result;
+    do {
+        result = refresh(&inputs, terminal);
+        if (fflush(stdout) != 0) {
+            perror("stdout");
+            result = 1;
+        }
+        if (result != 0 || !inputs.watch) {
+            break;
+        }
+
+        struct timespec remaining = inputs.interval;
+        while (nanosleep(&remaining, &remaining) != 0) {
+            if (errno != EINTR) {
+                perror("nanosleep");
+                result = 1;
+                break;
+            }
+        }
+    } while (result == 0);
+
+    if (inputs.use_filter) {
+        regfree(&inputs.filter);
+    }
+    return result;
 }

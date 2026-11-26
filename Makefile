@@ -13,6 +13,7 @@ all: $(TARGET)
 
 test: $(TARGET)
 	bash test_pidtree.sh
+	python3 test_watch.py
 
 $(TARGET): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
