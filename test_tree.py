@@ -59,6 +59,12 @@ def fixture():
 class TreeTests(unittest.TestCase):
     def setUp(self):
         self.env = {**os.environ, "TERM": "xterm", "NO_COLOR": ""}
+        with open("/proc/sys/kernel/pid_max") as file:
+            self.pid_width = max(3, len(str(int(file.read()) - 1)))
+        self.max_cpu = os.sysconf("SC_NPROCESSORS_ONLN") * 100
+        self.cpu_width = len(f"{self.max_cpu:.1f}")
+        self.header = (f"{'PID':>{self.pid_width}} {'%CPU':>{self.cpu_width}} "
+                       f"{'%MEM':>5} COMMAND")
 
     def plain(self, output):
         output = re.sub(r"\x1b\[[0-9;]*m", "", output)
@@ -82,7 +88,7 @@ class TreeTests(unittest.TestCase):
 
     def rows(self, output):
         lines = self.plain(output).splitlines()
-        self.assertEqual(lines[0].split(), ["PID", "%CPU", "%MEM", "COMMAND"])
+        self.assertEqual(lines[0], self.header)
         rows = []
         for line in lines[1:]:
             match = re.fullmatch(r"\s*(\d+)\s+(\d+\.\d)\s+(\d+\.\d) (.*)", line)
@@ -195,12 +201,16 @@ int main(int argc, char **argv) {
             for cpu, mem, cpu_color, mem_color in (
                     (0, 0, 32, 32), (49, 9, 32, 32), (50, 10, 33, 33),
                     (89, 24, 33, 33), (90, 25, 31, 31), (200, 80, 31, 31),
-                    (0, 25, 32, 31), (90, 0, 31, 32)):
+                    (0, 25, 32, 31), (90, 0, 31, 32),
+                    (100, 100, 31, 31), (self.max_cpu, 100, 31, 31)):
                 with self.subTest(cpu=cpu, mem=mem):
                     output = subprocess.check_output([binary, str(cpu), str(mem)],
                                                      text=True, timeout=3)
-                    self.assertIn(f"\x1b[{cpu_color}m{cpu:4.1f}\x1b[0m "
-                                  f"\x1b[{mem_color}m{mem:4.1f}\x1b[0m", output)
+                    self.assertIn(f"\x1b[{cpu_color}m{cpu:{self.cpu_width}.1f}\x1b[0m "
+                                  f"\x1b[{mem_color}m{mem:5.1f}\x1b[0m", output)
+                    header, row = self.plain(output).splitlines()
+                    self.assertEqual(header, self.header)
+                    self.assertEqual(row.index(binary), header.index("COMMAND"))
 
     def test_terminal_pid_lists_remain_plain(self):
         pids, _, _ = self.start_tree()
@@ -294,7 +304,7 @@ int main(int argc, char **argv) {
                       terminal=True, rows=1, cols=5, env=self.env)
         frame = watch.frame().decode()
         self.assertTrue(frame.endswith("\x1b[0m"), repr(frame))
-        self.assertEqual(self.plain(frame), "    P")
+        self.assertEqual(self.plain(frame), self.header[:5])
 
     def test_watch_cpu_tracks_each_interval_when_process_stops_and_resumes(self):
         proc = subprocess.Popen([
@@ -360,8 +370,10 @@ int main(int argc, char **argv) {
         proc = subprocess.Popen(["éé界e\u0301", "60"], executable="/usr/bin/sleep")
         self.addCleanup(proc.wait, timeout=2)
         self.addCleanup(proc.terminate)
-        for cols, suffix in ((19, "é\r\né界e\u0301 60\r\n"),
-                             (2, "éé\r\n界\r\ne\u0301 \r\n60\r\n")):
+        command_column = self.header.index("COMMAND")
+        narrow_prefix = "é\r\né" if command_column % 2 else "éé"
+        for cols, suffix in ((command_column + 1, "é\r\né界e\u0301 60\r\n"),
+                             (2, narrow_prefix + "\r\n界\r\ne\u0301 \r\n60\r\n")):
             with self.subTest(cols=cols):
                 watch = Watch(self, ["--watch=0.05", "-t", "-p", str(proc.pid)],
                               terminal=True, rows=50, cols=cols,

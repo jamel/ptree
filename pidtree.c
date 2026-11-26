@@ -335,10 +335,28 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
     fclose(f);
     long ticks = sysconf(_SC_CLK_TCK);
     long pages = sysconf(_SC_PHYS_PAGES);
-    if (read != 1 || ticks <= 0 || pages <= 0) {
+    long ncores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (read != 1 || ticks <= 0 || pages <= 0 || ncores <= 0) {
         errno = EIO;
         return -1;
     }
+
+    /* pid_max is the allocation wrap value; use the PID type's limit if hidden. */
+    int pid_max = INT32_MAX;
+    f = fopen("/proc/sys/kernel/pid_max", "r");
+    if (f) {
+        if (fscanf(f, "%d", &pid_max) != 1 || pid_max <= 1) {
+            pid_max = INT32_MAX;
+        }
+        fclose(f);
+    }
+    int pid_width = snprintf(NULL, 0, "%d", pid_max - 1);
+    if (pid_width < 3) {
+        pid_width = 3;
+    }
+    int cpu_width = snprintf(NULL, 0, "%.1f", ncores * 100.0);
+    int mem_width = snprintf(NULL, 0, "%.1f", 100.0);
+
     double interval = 0;
     if (previous && previous->procs) {
         interval = (double)(current->sampled_at.tv_sec - previous->sampled_at.tv_sec)
@@ -373,8 +391,8 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
     }
 
     const char *reset = color ? "\033[0m" : "";
-    fprintf(out, "%s%7s %4s %4s %s%s\n", color ? "\033[1m" : "",
-            "PID", "%CPU", "%MEM", "COMMAND", reset);
+    fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
+            pid_width, "PID", cpu_width, "%CPU", mem_width, "%MEM", "COMMAND", reset);
     size_t depth = 0;
     for (size_t cur = root; cur != SIZE_MAX;) {
         proc_t *proc = &procs[cur];
@@ -402,10 +420,10 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             }
         }
         double mem = proc->rss > 0 ? 100.0 * proc->rss / pages : 0;
-        fprintf(out, "%s%7d%s %s%4.1f%s %s%4.1f%s ",
-                color ? "\033[36m" : "", (int)proc->pid, reset,
-                color ? usage_color(cpu, 50, 90) : "", cpu, reset,
-                color ? usage_color(mem, 10, 25) : "", mem, reset);
+        fprintf(out, "%s%*d%s %s%*.1f%s %s%*.1f%s ",
+                color ? "\033[36m" : "", pid_width, (int)proc->pid, reset,
+                color ? usage_color(cpu, 50, 90) : "", cpu_width, cpu, reset,
+                color ? usage_color(mem, 10, 25) : "", mem_width, mem, reset);
         if (color && depth) {
             fputs("\033[2m", out);
         }
