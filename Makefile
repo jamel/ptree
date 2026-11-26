@@ -12,7 +12,7 @@ OBJ := $(SRC:.c=.o)
 all: $(TARGET)
 
 test: $(TARGET)
-	bash test_ptree.sh
+	python3 test_ptree.py
 	python3 test_tree.py
 	python3 test_watch.py
 
