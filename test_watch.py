@@ -17,17 +17,18 @@ CLEAR = b"\x1b[H\x1b[J"
 
 
 class Watch:
-    def __init__(self, case, args, terminal=False, rows=24, cols=80):
+    def __init__(self, case, args, terminal=False, rows=24, cols=80, env=None):
         self.buffer = b""
         self.terminal = terminal
         if terminal:
             self.fd, slave = pty.openpty()
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-            self.proc = subprocess.Popen(["./pidtree", *args], stdout=slave, stderr=subprocess.PIPE)
+            self.proc = subprocess.Popen(["./pidtree", *args], stdout=slave,
+                                         stderr=subprocess.PIPE, env=env)
             os.close(slave)
         else:
             self.proc = subprocess.Popen(["./pidtree", *args], stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE)
+                                         stderr=subprocess.PIPE, env=env)
             self.fd = self.proc.stdout.fileno()
         case.addCleanup(self.close)
 

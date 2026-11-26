@@ -9,10 +9,12 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
+#include <locale.h>
 #include <math.h>
 #include <regex.h>
 #include <stdint.h>
@@ -23,16 +25,28 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 typedef struct {
     pid_t pid;
     pid_t ppid;
     int selected;
+    unsigned long long utime, stime, starttime;
+    long rss;
+    char comm[256];
+    size_t child, sibling;
 } proc_t;
+
+typedef struct {
+    proc_t *procs;
+    size_t n;
+    struct timespec sampled_at;
+} snapshot_t;
 
 typedef struct {
     pid_t root;
     int comma;
+    int tree;
     int use_filter;
     regex_t filter;
     int watch;
@@ -46,14 +60,14 @@ typedef enum {
 } parse_result_t;
 
 /*
- * Read the PPID from /proc/<pid>/stat.
+ * Read the parent, CPU times, resident pages, and name from /proc/<pid>/stat.
  *
  * The "stat" file has the form:
  *   <pid> (<comm>) <state> <ppid> ...
  * where <comm> may itself contain spaces and parentheses. To parse safely
  * we locate the LAST ')' and read fields after it.
  */
-static int read_ppid(pid_t pid, pid_t *ppid_out) {
+static int read_stat(pid_t pid, proc_t *proc) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
 
@@ -70,18 +84,27 @@ static int read_ppid(pid_t pid, pid_t *ppid_out) {
     }
     buf[n] = '\0';
 
+    char *lparen = strchr(buf, '(');
     char *rparen = strrchr(buf, ')');
-    if (!rparen) {
+    if (!lparen || !rparen || rparen <= lparen) {
         return -1;
     }
 
     char state;
     int ppid;
-    if (sscanf(rparen + 1, " %c %d", &state, &ppid) != 2) {
+    if (sscanf(rparen + 1, " %c %d"
+               " %*s %*s %*s %*s %*s %*s %*s %*s %*s" /* fields 5-13 */
+               " %llu %llu"                            /* utime, stime */
+               " %*s %*s %*s %*s %*s %*s"               /* fields 16-21 */
+               " %llu %*s %ld",                        /* starttime, vsize, rss */
+               &state, &ppid, &proc->utime, &proc->stime,
+               &proc->starttime, &proc->rss) != 6) {
         return -1;
     }
 
-    *ppid_out = (pid_t)ppid;
+    proc->pid = pid;
+    proc->ppid = (pid_t)ppid;
+    snprintf(proc->comm, sizeof(proc->comm), "%.*s", (int)(rparen - lparen - 1), lparen + 1);
     return 0;
 }
 
@@ -97,12 +120,9 @@ static int is_all_digits(const char *s) {
     return 1;
 }
 
-/* Return 1 for a match, 0 for unreadable/empty command lines, -1 on allocation failure. */
-static int matches_filter(pid_t pid, const regex_t *filter) {
-    if (pid == getpid()) {
-        return 0;
-    }
-
+/* The caller frees *out; unreadable command lines leave it NULL. */
+static int read_cmdline(pid_t pid, char **out) {
+    *out = NULL;
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
     FILE *f = fopen(path, "r");
@@ -143,7 +163,24 @@ static int matches_filter(pid_t pid, const regex_t *filter) {
         }
     }
     cmdline[n] = '\0';
-    int matched = readable && n > 0 && regexec(filter, cmdline, 0, NULL, 0) == 0;
+    if (readable) {
+        *out = cmdline;
+    } else {
+        free(cmdline);
+    }
+    return 0;
+}
+
+/* Return 1 for a match, 0 for unreadable/empty command lines, -1 on allocation failure. */
+static int matches_filter(pid_t pid, const regex_t *filter) {
+    if (pid == getpid()) {
+        return 0;
+    }
+    char *cmdline;
+    if (read_cmdline(pid, &cmdline) != 0) {
+        return -1;
+    }
+    int matched = cmdline && *cmdline && regexec(filter, cmdline, 0, NULL, 0) == 0;
     free(cmdline);
     return matched;
 }
@@ -169,8 +206,8 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
         }
 
         pid_t pid = (pid_t)atoi(e->d_name);
-        pid_t ppid;
-        if (read_ppid(pid, &ppid) != 0) {
+        proc_t proc = {0};
+        if (read_stat(pid, &proc) != 0) {
             continue; /* process gone, skip */
         }
 
@@ -184,8 +221,7 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
             }
             arr = t;
         }
-        arr[n].pid = pid;
-        arr[n].ppid = ppid;
+        arr[n] = proc;
         arr[n].selected = filter ? matches_filter(pid, filter) : pid == root;
         if (arr[n].selected < 0) {
             free(arr);
@@ -214,24 +250,146 @@ static void print_pid(FILE *out, pid_t pid, int comma, int *printed) {
     fprintf(out, "%d\n", (int)pid);
 }
 
+static int compare_pid(const void *a, const void *b) {
+    pid_t left = ((const proc_t *)a)->pid;
+    pid_t right = ((const proc_t *)b)->pid;
+    return (left > right) - (left < right);
+}
+
+/* Keep commands on one display line, including in terminal watch mode. */
+static void print_command(FILE *out, const char *command) {
+    for (; *command; command++) {
+        unsigned char c = (unsigned char)*command;
+        fputc(iscntrl(c) ? '?' : c, out);
+    }
+}
+
+static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previous) {
+    proc_t *procs = current->procs;
+    size_t n = current->n;
+    double uptime;
+    FILE *f = fopen("/proc/uptime", "r");
+    if (!f) {
+        return -1;
+    }
+    int read = fscanf(f, "%lf", &uptime);
+    fclose(f);
+    long ticks = sysconf(_SC_CLK_TCK);
+    long pages = sysconf(_SC_PHYS_PAGES);
+    if (read != 1 || ticks <= 0 || pages <= 0) {
+        errno = EIO;
+        return -1;
+    }
+    double interval = 0;
+    if (previous && previous->procs) {
+        interval = (double)(current->sampled_at.tv_sec - previous->sampled_at.tv_sec)
+                   + (current->sampled_at.tv_nsec - previous->sampled_at.tv_nsec) / 1e9;
+    }
+    size_t *ancestors = malloc(n * sizeof(*ancestors));
+    if (!ancestors) {
+        return -1;
+    }
+
+    qsort(procs, n, sizeof(*procs), compare_pid);
+    for (size_t i = 0; i < n; i++) {
+        procs[i].child = procs[i].sibling = SIZE_MAX;
+    }
+    /* Prepend in reverse PID order so roots and siblings print in PID order.
+     * A matching descendant stays under its selected parent, even if it also
+     * matched the filter itself. */
+    size_t root = SIZE_MAX;
+    for (size_t i = n; i-- > 0;) {
+        if (!procs[i].selected) {
+            continue;
+        }
+        size_t *head = &root;
+        for (size_t j = 0; j < n; j++) {
+            if (procs[j].selected && procs[j].pid == procs[i].ppid && i != j) {
+                head = &procs[j].child;
+                break;
+            }
+        }
+        procs[i].sibling = *head;
+        *head = i;
+    }
+
+    fprintf(out, "%7s %4s %4s %s\n", "PID", "%CPU", "%MEM", "COMMAND");
+    size_t depth = 0;
+    for (size_t cur = root; cur != SIZE_MAX;) {
+        proc_t *proc = &procs[cur];
+        char *command;
+        if (read_cmdline(proc->pid, &command) != 0) {
+            free(ancestors);
+            return -1;
+        }
+        /* Use the lifetime average for one-shot output and a process's first
+         * sample. Watch frames use CPU time consumed since the last scan. */
+        double elapsed = uptime - (double)proc->starttime / ticks;
+        double cpu = elapsed > 0 ? 100.0 * ((double)proc->utime + proc->stime) / ticks / elapsed : 0;
+        if (interval > 0) {
+            for (size_t i = 0; i < previous->n; i++) {
+                const proc_t *old = &previous->procs[i];
+                /* A reused PID belongs to a different process. */
+                if (old->pid == proc->pid && old->starttime == proc->starttime &&
+                    proc->utime >= old->utime && proc->stime >= old->stime) {
+                    double used = (double)(proc->utime - old->utime)
+                                  + (double)(proc->stime - old->stime);
+                    cpu = 100.0 * used / ticks / interval;
+                    break;
+                }
+            }
+        }
+        double mem = proc->rss > 0 ? 100.0 * proc->rss / pages : 0;
+        fprintf(out, "%7d %4.1f %4.1f ", (int)proc->pid, cpu, mem);
+        for (size_t i = 1; i < depth; i++) {
+            fputs(procs[ancestors[i]].sibling != SIZE_MAX ? " |  " : "    ", out);
+        }
+        if (depth) {
+            fputs(" \\_ ", out);
+        }
+        if (command && *command) {
+            print_command(out, command);
+        } else {
+            fputc('[', out);
+            print_command(out, proc->comm);
+            fputc(']', out);
+        }
+        fputc('\n', out);
+        free(command);
+
+        if (proc->child != SIZE_MAX) {
+            ancestors[depth++] = cur;
+            cur = proc->child;
+        } else {
+            while (procs[cur].sibling == SIZE_MAX && depth > 0) {
+                cur = ancestors[--depth];
+            }
+            cur = procs[cur].sibling;
+        }
+    }
+    free(ancestors);
+    return 0;
+}
+
 /*
- * BFS from all selected roots, printing each PID once. Each iteration scans the
+ * BFS from all selected roots, selecting each PID once. Each iteration scans the
  * proc table for children of the current frontier. O(n^2) worst case,
  * which is trivial for realistic process counts (a few thousand).
  */
-static int print_trees(FILE *out, proc_t *procs, size_t n, int comma) {
+static int print_trees(FILE *out, snapshot_t *current, int comma, int tree,
+                       const snapshot_t *previous) {
+    proc_t *procs = current->procs;
+    size_t n = current->n;
     pid_t *queue = malloc(n * sizeof(*queue));
     if (!queue) {
         return -1;
     }
 
     size_t head = 0, tail = 0;
-    int printed = 0;
 
     for (size_t i = 0; i < n; i++) {
         if (procs[i].selected) {
             queue[tail++] = procs[i].pid;
-            print_pid(out, procs[i].pid, comma, &printed);
         }
     }
 
@@ -240,16 +398,21 @@ static int print_trees(FILE *out, proc_t *procs, size_t n, int comma) {
         for (size_t i = 0; i < n; i++) {
             if (!procs[i].selected && procs[i].ppid == cur) {
                 procs[i].selected = 1;
-                print_pid(out, procs[i].pid, comma, &printed);
                 queue[tail++] = procs[i].pid;
             }
         }
     }
-    if (comma) {
-        fprintf(out, "\n");
+    if (!tree) {
+        int printed = 0;
+        for (size_t i = 0; i < tail; i++) {
+            print_pid(out, queue[i], comma, &printed);
+        }
+        if (comma) {
+            fprintf(out, "\n");
+        }
     }
     free(queue);
-    return 0;
+    return tree ? print_forest(out, current, previous) : 0;
 }
 
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
@@ -260,6 +423,7 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     const char *interval_arg = NULL;
     static const struct option options[] = {
         {"comma", no_argument, NULL, 'c'},
+        {"tree", no_argument, NULL, 't'},
         {"pid", required_argument, NULL, 'p'},
         {"filter", required_argument, NULL, 'f'},
         {"watch", optional_argument, NULL, 'w'},
@@ -267,9 +431,10 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
         {NULL, 0, NULL, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "cp:f:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "ctp:f:h", options, NULL)) != -1) {
         switch (opt) {
         case 'c': inputs->comma = 1; break;
+        case 't': inputs->tree = 1; break;
         case 'p': pid_arg = optarg; break;
         case 'f': pattern = optarg; break;
         case 'w':
@@ -286,9 +451,12 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
                    "\n"
                    "Options:\n"
                    "  -c, --comma             Separate PIDs with commas instead of newlines.\n"
+                   "  -t, --tree              Show a process tree with PID, %%CPU, %%MEM, and command.\n"
+                   "                         Cannot be combined with --comma.\n"
                    "  -p, --pid <pid>         Select a root process by PID.\n"
                    "  -f, --filter <pattern>  Match full command lines using an extended regex.\n"
                    "      --watch [interval]  Refresh every interval seconds (default: 5; Ctrl-C to stop).\n"
+                   "                         Tree CPU usage is measured between refreshes after the first sample.\n"
                    "  -h, --help              Display this help and exit.\n",
                    argv[0]);
             return PARSE_HELP;
@@ -297,6 +465,10 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     }
     if (optind != argc || (!pid_arg && !pattern) || (pid_arg && pattern)) {
         fprintf(stderr, "usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n", argv[0]);
+        return PARSE_ERROR;
+    }
+    if (inputs->tree && inputs->comma) {
+        fprintf(stderr, "--tree and --comma cannot be combined\n");
         return PARSE_ERROR;
     }
 
@@ -334,19 +506,23 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     return PARSE_OK;
 }
 
-static int print_snapshot(const cli_opts_t *inputs, FILE *out) {
-    proc_t *procs;
-    size_t n;
-    int result = collect_procs(&procs, &n, inputs->root,
+static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previous) {
+    snapshot_t current = {0};
+    int result = collect_procs(&current.procs, &current.n, inputs->root,
                               inputs->use_filter ? &inputs->filter : NULL);
     if (result != 0) {
         perror("collect_procs");
         return 1;
     }
+    if (previous && clock_gettime(CLOCK_MONOTONIC, &current.sampled_at) != 0) {
+        perror("clock_gettime");
+        free(current.procs);
+        return 1;
+    }
 
     int found = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (procs[i].selected) {
+    for (size_t i = 0; i < current.n; i++) {
+        if (current.procs[i].selected) {
             found = 1;
             break;
         }
@@ -355,15 +531,19 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out) {
         if (!inputs->watch && !inputs->use_filter) {
             fprintf(stderr, "pid %d not found\n", (int)inputs->root);
         }
-        free(procs);
-        return inputs->watch ? 0 : 1;
+        result = inputs->watch ? 0 : 1;
+    } else {
+        result = print_trees(out, &current, inputs->comma, inputs->tree, previous);
+        if (result != 0) {
+            perror("print_trees");
+        }
     }
-
-    result = print_trees(out, procs, n, inputs->comma);
-    if (result != 0) {
-        perror("print_trees");
+    if (previous) {
+        free(previous->procs);
+        *previous = current;
+    } else {
+        free(current.procs);
     }
-    free(procs);
     return result != 0 ? 1 : 0;
 }
 
@@ -374,17 +554,40 @@ static void redraw(const char *frame) {
     int rows = size.ws_row ? size.ws_row : 24;
     int cols = size.ws_col ? size.ws_col : 80;
     int row = 0, col = 0;
+    mbstate_t state = {0};
+    /* Apply the user's character encoding to display without changing regexes. */
+    locale_t display_locale = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
+    locale_t previous_locale = uselocale(display_locale);
 
     printf("\033[H\033[J");
-    for (; *frame && row < rows; frame++) {
+    while (*frame && row < rows) {
         if (*frame == '\n') {
             row++;
             if (row < rows) {
                 putchar('\n');
             }
             col = 0;
+            frame++;
         } else {
-            if (col == cols) {
+            wchar_t wc;
+            size_t length = mbrtowc(&wc, frame, MB_CUR_MAX, &state);
+            size_t count = length;
+            const char *text = frame;
+            int width;
+            if (length == (size_t)-1 || length == (size_t)-2) {
+                state = (mbstate_t){0};
+                length = count = 1;
+                text = "?";
+                width = 1;
+            } else {
+                width = wcwidth(wc);
+                if (width < 0 || width > cols) {
+                    count = 1;
+                    text = "?";
+                    width = 1;
+                }
+            }
+            if (col + width > cols) {
                 row++;
                 if (row == rows) {
                     break;
@@ -392,15 +595,20 @@ static void redraw(const char *frame) {
                 putchar('\n');
                 col = 0;
             }
-            putchar(*frame);
-            col++;
+            fwrite(text, 1, count, stdout);
+            col += width;
+            frame += length;
         }
+    }
+    if (display_locale) {
+        uselocale(previous_locale);
+        freelocale(display_locale);
     }
 }
 
-static int refresh(const cli_opts_t *inputs, int terminal) {
+static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous) {
     if (!terminal) {
-        return print_snapshot(inputs, stdout);
+        return print_snapshot(inputs, stdout, previous);
     }
 
     char *frame = NULL;
@@ -410,7 +618,7 @@ static int refresh(const cli_opts_t *inputs, int terminal) {
         perror("open_memstream");
         return 1;
     }
-    int result = print_snapshot(inputs, out);
+    int result = print_snapshot(inputs, out, previous);
     if (fclose(out) != 0) {
         perror("fclose");
         result = 1;
@@ -439,9 +647,10 @@ int main(int argc, char **argv) {
     setvbuf(stdout, output, _IOFBF, sizeof(output));
 
     int terminal = inputs.watch && isatty(STDOUT_FILENO);
+    snapshot_t previous = {0};
     int result;
     do {
-        result = refresh(&inputs, terminal);
+        result = refresh(&inputs, terminal, inputs.watch && inputs.tree ? &previous : NULL);
         if (fflush(stdout) != 0) {
             perror("stdout");
             result = 1;
@@ -460,6 +669,7 @@ int main(int argc, char **argv) {
         }
     } while (result == 0);
 
+    free(previous.procs);
     if (inputs.use_filter) {
         regfree(&inputs.filter);
     }
