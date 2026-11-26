@@ -44,9 +44,14 @@ typedef struct {
 } snapshot_t;
 
 typedef struct {
+    size_t start, end;
+} command_name_t;
+
+typedef struct {
     pid_t root;
     int comma;
     int tree;
+    int color;
     int use_filter;
     regex_t filter;
     int watch;
@@ -121,8 +126,11 @@ static int is_all_digits(const char *s) {
 }
 
 /* The caller frees *out; unreadable command lines leave it NULL. */
-static int read_cmdline(pid_t pid, char **out) {
+static int read_cmdline(pid_t pid, char **out, const char *comm, command_name_t *name) {
     *out = NULL;
+    if (name) {
+        *name = (command_name_t){0};
+    }
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
     FILE *f = fopen(path, "r");
@@ -157,6 +165,31 @@ static int read_cmdline(pid_t pid, char **out) {
     if (n > 0 && cmdline[n - 1] == '\0') {
         n--;
     }
+    if (name) {
+        /* Match comm before joining arguments, so spaces in paths are safe.
+         * Linux may truncate comm to 15 bytes. Fall back to argv[0]'s basename
+         * when a process has renamed itself or supplied a different argv[0]. */
+        size_t comm_len = strlen(comm);
+        for (size_t arg = 0; arg < n;) {
+            size_t end = arg + strnlen(cmdline + arg, n - arg);
+            size_t base = arg;
+            for (size_t i = arg; i < end; i++) {
+                if (cmdline[i] == '/') {
+                    base = i + 1;
+                }
+            }
+            int matched = comm_len > 0 && end - base >= comm_len
+                          && (end - base == comm_len || comm_len == 15)
+                          && memcmp(cmdline + base, comm, comm_len) == 0;
+            if (arg == 0 || matched) {
+                *name = (command_name_t){.start = base, .end = end};
+            }
+            if (matched) {
+                break;
+            }
+            arg = end + 1;
+        }
+    }
     for (size_t i = 0; i < n; i++) {
         if (cmdline[i] == '\0') {
             cmdline[i] = ' ';
@@ -177,7 +210,7 @@ static int matches_filter(pid_t pid, const regex_t *filter) {
         return 0;
     }
     char *cmdline;
-    if (read_cmdline(pid, &cmdline) != 0) {
+    if (read_cmdline(pid, &cmdline, NULL, NULL) != 0) {
         return -1;
     }
     int matched = cmdline && *cmdline && regexec(filter, cmdline, 0, NULL, 0) == 0;
@@ -257,14 +290,40 @@ static int compare_pid(const void *a, const void *b) {
 }
 
 /* Keep commands on one display line, including in terminal watch mode. */
-static void print_command(FILE *out, const char *command) {
+static void print_command(FILE *out, const char *command, command_name_t name,
+                          int color) {
+    const char *start = command + name.start;
+    const char *end = command + name.end;
+    if (color && start != command) {
+        fputs("\033[90m", out);
+    }
     for (; *command; command++) {
+        if (color && command == start) {
+            fputs("\033[97m", out);
+        }
+        if (color && command == end) {
+            fputs("\033[0m", out);
+        }
         unsigned char c = (unsigned char)*command;
         fputc(iscntrl(c) ? '?' : c, out);
     }
+    if (color && command == end) {
+        fputs("\033[0m", out);
+    }
 }
 
-static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previous) {
+static const char *usage_color(double value, double yellow, double red) {
+    if (value >= red) {
+        return "\033[31m";
+    }
+    if (value >= yellow) {
+        return "\033[33m";
+    }
+    return "\033[32m";
+}
+
+static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previous,
+                        int color) {
     proc_t *procs = current->procs;
     size_t n = current->n;
     double uptime;
@@ -313,12 +372,15 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
         *head = i;
     }
 
-    fprintf(out, "%7s %4s %4s %s\n", "PID", "%CPU", "%MEM", "COMMAND");
+    const char *reset = color ? "\033[0m" : "";
+    fprintf(out, "%s%7s %4s %4s %s%s\n", color ? "\033[1m" : "",
+            "PID", "%CPU", "%MEM", "COMMAND", reset);
     size_t depth = 0;
     for (size_t cur = root; cur != SIZE_MAX;) {
         proc_t *proc = &procs[cur];
         char *command;
-        if (read_cmdline(proc->pid, &command) != 0) {
+        command_name_t name;
+        if (read_cmdline(proc->pid, &command, proc->comm, &name) != 0) {
             free(ancestors);
             return -1;
         }
@@ -340,18 +402,25 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             }
         }
         double mem = proc->rss > 0 ? 100.0 * proc->rss / pages : 0;
-        fprintf(out, "%7d %4.1f %4.1f ", (int)proc->pid, cpu, mem);
+        fprintf(out, "%s%7d%s %s%4.1f%s %s%4.1f%s ",
+                color ? "\033[36m" : "", (int)proc->pid, reset,
+                color ? usage_color(cpu, 50, 90) : "", cpu, reset,
+                color ? usage_color(mem, 10, 25) : "", mem, reset);
+        if (color && depth) {
+            fputs("\033[2m", out);
+        }
         for (size_t i = 1; i < depth; i++) {
             fputs(procs[ancestors[i]].sibling != SIZE_MAX ? " |  " : "    ", out);
         }
         if (depth) {
             fputs(" \\_ ", out);
+            fputs(reset, out);
         }
         if (command && *command) {
-            print_command(out, command);
+            print_command(out, command, name, color);
         } else {
             fputc('[', out);
-            print_command(out, proc->comm);
+            print_command(out, proc->comm, (command_name_t){.end = strlen(proc->comm)}, color);
             fputc(']', out);
         }
         fputc('\n', out);
@@ -376,7 +445,7 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
  * proc table for children of the current frontier. O(n^2) worst case,
  * which is trivial for realistic process counts (a few thousand).
  */
-static int print_trees(FILE *out, snapshot_t *current, int comma, int tree,
+static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int color,
                        const snapshot_t *previous) {
     proc_t *procs = current->procs;
     size_t n = current->n;
@@ -412,7 +481,7 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree,
         }
     }
     free(queue);
-    return tree ? print_forest(out, current, previous) : 0;
+    return tree ? print_forest(out, current, previous, color) : 0;
 }
 
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
@@ -452,6 +521,9 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
                    "Options:\n"
                    "  -c, --comma             Separate PIDs with commas instead of newlines.\n"
                    "  -t, --tree              Show a process tree with PID, %%CPU, %%MEM, and command.\n"
+                   "                         Color on terminals unless NO_COLOR is nonempty or TERM=dumb.\n"
+                   "                         CPU colors: green <50%%, yellow <90%%, red >=90%%.\n"
+                   "                         Memory colors: green <10%%, yellow <25%%, red >=25%%.\n"
                    "                         Cannot be combined with --comma.\n"
                    "  -p, --pid <pid>         Select a root process by PID.\n"
                    "  -f, --filter <pattern>  Match full command lines using an extended regex.\n"
@@ -533,7 +605,7 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
         }
         result = inputs->watch ? 0 : 1;
     } else {
-        result = print_trees(out, &current, inputs->comma, inputs->tree, previous);
+        result = print_trees(out, &current, inputs->comma, inputs->tree, inputs->color, previous);
         if (result != 0) {
             perror("print_trees");
         }
@@ -548,7 +620,7 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
 }
 
 /* Bound each frame to the current terminal size so refreshes never scroll. */
-static void redraw(const char *frame) {
+static void redraw(const char *frame, int color) {
     struct winsize size = {0};
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &size);
     int rows = size.ws_row ? size.ws_row : 24;
@@ -561,6 +633,15 @@ static void redraw(const char *frame) {
 
     printf("\033[H\033[J");
     while (*frame && row < rows) {
+        /* Renderer-generated SGR sequences take no display columns. */
+        if (frame[0] == '\033' && frame[1] == '[') {
+            size_t length = 2 + strspn(frame + 2, "0123456789;");
+            if (frame[length] == 'm') {
+                fwrite(frame, 1, length + 1, stdout);
+                frame += length + 1;
+                continue;
+            }
+        }
         if (*frame == '\n') {
             row++;
             if (row < rows) {
@@ -600,6 +681,10 @@ static void redraw(const char *frame) {
             frame += length;
         }
     }
+    if (color && *frame) {
+        /* Clipping may discard the reset at the end of a styled field. */
+        fputs("\033[0m", stdout);
+    }
     if (display_locale) {
         uselocale(previous_locale);
         freelocale(display_locale);
@@ -624,7 +709,7 @@ static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous)
         result = 1;
     }
     if (result == 0) {
-        redraw(frame);
+        redraw(frame, inputs->color);
     }
     free(frame);
     return result;
@@ -646,11 +731,16 @@ int main(int argc, char **argv) {
     static char output[1 << 16];
     setvbuf(stdout, output, _IOFBF, sizeof(output));
 
-    int terminal = inputs.watch && isatty(STDOUT_FILENO);
+    int terminal = isatty(STDOUT_FILENO);
+    const char *no_color = getenv("NO_COLOR");
+    const char *term = getenv("TERM");
+    inputs.color = inputs.tree && terminal && !(no_color && *no_color)
+                   && !(term && strcmp(term, "dumb") == 0);
     snapshot_t previous = {0};
     int result;
     do {
-        result = refresh(&inputs, terminal, inputs.watch && inputs.tree ? &previous : NULL);
+        result = refresh(&inputs, inputs.watch && terminal,
+                         inputs.watch && inputs.tree ? &previous : NULL);
         if (fflush(stdout) != 0) {
             perror("stdout");
             result = 1;

@@ -2,9 +2,11 @@
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -55,6 +57,14 @@ def fixture():
 
 
 class TreeTests(unittest.TestCase):
+    def setUp(self):
+        self.env = {**os.environ, "TERM": "xterm", "NO_COLOR": ""}
+
+    def plain(self, output):
+        output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+        self.assertNotIn("\x1b", output)
+        return output
+
     def start_tree(self, token=None):
         token = token or "pidtree-tree-" + uuid.uuid4().hex
         args = [sys.executable, __file__, "--fixture", token]
@@ -71,7 +81,7 @@ class TreeTests(unittest.TestCase):
         return pids, " ".join(args), token
 
     def rows(self, output):
-        lines = output.splitlines()
+        lines = self.plain(output).splitlines()
         self.assertEqual(lines[0].split(), ["PID", "%CPU", "%MEM", "COMMAND"])
         rows = []
         for line in lines[1:]:
@@ -82,10 +92,123 @@ class TreeTests(unittest.TestCase):
 
     def run_tree(self, *args):
         result = subprocess.run(["./pidtree", *args], capture_output=True, text=True,
-                                timeout=3)
+                                timeout=3, env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
+        self.assertNotIn("\x1b", result.stdout)
         return self.rows(result.stdout)
+
+    def run_terminal(self, *args, lines, env=None):
+        output = Watch(self, args, terminal=True, env=env or self.env)
+        text = b"".join(output.read_until(b"\n") for _ in range(lines)).decode()
+        self.assertEqual(output.proc.wait(timeout=2), 0)
+        self.assertEqual(output.proc.stderr.read(), b"")
+        return text
+
+    def test_terminal_tree_adds_color_without_changing_layout(self):
+        pids, command, _ = self.start_tree()
+        output = self.run_terminal("-t", "-p", str(pids[0]), lines=5)
+        self.assertRegex(output, r"\x1b\[[0-9;]*3[0-7]m")
+        rows = self.rows(output)
+        self.assertEqual([row[0] for row in rows], pids)
+        self.assertEqual([row[3] for row in rows], [
+            command, " \\_ " + command, " |   \\_ " + command, " \\_ " + command,
+        ])
+        for line in output.splitlines():
+            self.assertEqual(re.findall(r"\x1b\[[0-9;]*m", line)[-1], "\x1b[0m")
+
+    def test_terminal_color_respects_environment_opt_out(self):
+        pids, _, _ = self.start_tree()
+        for override in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+            with self.subTest(override=override):
+                output = self.run_terminal("-t", "-p", str(pids[0]), lines=5,
+                                           env={**self.env, **override})
+                self.assertNotIn("\x1b", output)
+                self.assertEqual([row[0] for row in self.rows(output)], pids)
+
+    def test_terminal_command_highlights_basename_and_dims_path(self):
+        for executable in ("/usr/bin/sleep", "sleep", "/path with spaces/my sleep"):
+            with self.subTest(executable=executable):
+                proc = subprocess.Popen([executable, "60"], executable="/usr/bin/sleep")
+                self.addCleanup(proc.wait, timeout=2)
+                self.addCleanup(proc.terminate)
+                output = self.run_terminal("-t", "-p", str(proc.pid), lines=2)
+                prefix, name = os.path.split(executable)
+                styled = "\x1b[97m" + name + "\x1b[0m 60"
+                if prefix:
+                    styled = "\x1b[90m" + prefix + "/" + styled
+                self.assertTrue(output.endswith(styled + "\r\n"), repr(output))
+                self.assertEqual(self.rows(output)[0][3], executable + " 60")
+
+    def test_terminal_command_highlights_script_matching_comm(self):
+        for name in ("worker script", "long-worker-script-name"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, name)
+                with open(path, "w") as file:
+                    file.write("#!/bin/sh\nprintf 'ready\\n'\nread -r line\n")
+                os.chmod(path, 0o700)
+                proc = subprocess.Popen([path], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, text=True)
+                try:
+                    self.assertEqual(proc.stdout.readline(), "ready\n")
+                    output = self.run_terminal("-t", "-p", str(proc.pid), lines=2)
+                    self.assertTrue(output.endswith(
+                        f"\x1b[90m/bin/sh {directory}/\x1b[97m{name}\x1b[0m\r\n"),
+                        repr(output))
+                    self.assertEqual(self.rows(output)[0][3], "/bin/sh " + path)
+                finally:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                    proc.stdin.close()
+                    proc.stdout.close()
+
+    def test_usage_colors_change_at_thresholds(self):
+        # Render controlled snapshots without burning CPU or allocating RAM.
+        source = r'''
+#define main pidtree_main
+#include "pidtree.c"
+#undef main
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    long ticks = sysconf(_SC_CLK_TCK);
+    long pages = sysconf(_SC_PHYS_PAGES);
+    proc_t old = {.pid = getpid(), .selected = 1, .starttime = 1};
+    proc_t proc = old;
+    proc.utime = (unsigned long long)ticks * strtoul(argv[1], NULL, 10);
+    proc.rss = (pages * strtol(argv[2], NULL, 10) + 99) / 100;
+    snapshot_t previous = {.procs = &old, .n = 1, .sampled_at = {.tv_sec = 1}};
+    snapshot_t current = {.procs = &proc, .n = 1, .sampled_at = {.tv_sec = 101}};
+    return print_forest(stdout, &current, &previous, 1);
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "render.c")
+            binary = os.path.join(directory, "render")
+            with open(path, "w") as file:
+                file.write(source)
+            build = subprocess.run([
+                *shlex.split(os.environ.get("CC", "cc")), "-std=c99",
+                "-Wall", "-Wextra", "-Wpedantic",
+                "-I", os.path.dirname(os.path.abspath(__file__)), path, "-o", binary,
+            ], capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            for cpu, mem, cpu_color, mem_color in (
+                    (0, 0, 32, 32), (49, 9, 32, 32), (50, 10, 33, 33),
+                    (89, 24, 33, 33), (90, 25, 31, 31), (200, 80, 31, 31),
+                    (0, 25, 32, 31), (90, 0, 31, 32)):
+                with self.subTest(cpu=cpu, mem=mem):
+                    output = subprocess.check_output([binary, str(cpu), str(mem)],
+                                                     text=True, timeout=3)
+                    self.assertIn(f"\x1b[{cpu_color}m{cpu:4.1f}\x1b[0m "
+                                  f"\x1b[{mem_color}m{mem:4.1f}\x1b[0m", output)
+
+    def test_terminal_pid_lists_remain_plain(self):
+        pids, _, _ = self.start_tree()
+        for flags, lines in (([], 4), (["-c"], 1)):
+            with self.subTest(flags=flags):
+                output = self.run_terminal(*flags, "-p", str(pids[0]), lines=lines)
+                self.assertNotIn("\x1b", output)
+                self.assertEqual(set(map(int, output.replace(",", " ").split())), set(pids))
 
     def test_pid_tree_has_depth_first_branches_and_full_commands(self):
         pids, command, _ = self.start_tree()
@@ -132,7 +255,7 @@ class TreeTests(unittest.TestCase):
             "import os, sys\n"
             "child = os.fork()\n"
             "if child == 0:\n"
-            "    with open('/proc/self/comm', 'w') as f: f.write('tree ) (name')\n"
+            "    with open('/proc/self/comm', 'w') as f: f.write('tree/) (name')\n"
             "    os._exit(0)\n"
             "os.waitid(os.P_PID, child, os.WEXITED | os.WNOWAIT)\n"
             "print(child)\n"
@@ -150,15 +273,28 @@ class TreeTests(unittest.TestCase):
         rows = self.run_tree("-t", "-p", str(child))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], child)
-        self.assertEqual(rows[0][3], "[tree ) (name]")
+        self.assertEqual(rows[0][3], "[tree/) (name]")
+        output = self.run_terminal("-t", "-p", str(child), lines=2)
+        self.assertIn("[\x1b[97mtree/) (name\x1b[0m]", output)
 
     def test_watch_renders_tree_frames(self):
         pids, command, _ = self.start_tree()
         watch = Watch(self, ["--watch=0.05", "-t", "-p", str(pids[0])],
-                      terminal=True, rows=20, cols=1000)
-        rows = self.rows(watch.frame().decode())
-        self.assertEqual([row[0] for row in rows], pids)
-        self.assertEqual(rows[2][3], " |   \\_ " + command)
+                      terminal=True, rows=20, cols=1000, env=self.env)
+        for _ in range(2):
+            frame = watch.frame().decode()
+            self.assertRegex(frame, r"\x1b\[[0-9;]*3[0-7]m")
+            rows = self.rows(frame)
+            self.assertEqual([row[0] for row in rows], pids)
+            self.assertEqual(rows[2][3], " |   \\_ " + command)
+
+    def test_watch_resets_color_when_frame_is_clipped(self):
+        pids, _, _ = self.start_tree()
+        watch = Watch(self, ["--watch=0.05", "-t", "-p", str(pids[0])],
+                      terminal=True, rows=1, cols=5, env=self.env)
+        frame = watch.frame().decode()
+        self.assertTrue(frame.endswith("\x1b[0m"), repr(frame))
+        self.assertEqual(self.plain(frame), "    P")
 
     def test_watch_cpu_tracks_each_interval_when_process_stops_and_resumes(self):
         proc = subprocess.Popen([
@@ -179,13 +315,14 @@ class TreeTests(unittest.TestCase):
             with self.subTest(terminal=terminal):
                 proc.send_signal(signal.SIGCONT)
                 watch = Watch(self, ["--watch=0.05", "-t", "-p", str(proc.pid)],
-                              terminal=terminal, cols=1000)
+                              terminal=terminal, cols=1000, env=self.env)
 
                 def cpu():
                     if terminal:
                         frame = watch.frame()
                     else:
                         frame = watch.read_until(b"\n") + watch.read_until(b"\n")
+                        self.assertNotIn(b"\x1b", frame)
                     return self.rows(frame.decode())[0][1]
 
                 self.assertGreater(cpu(), 0)
@@ -228,8 +365,8 @@ class TreeTests(unittest.TestCase):
             with self.subTest(cols=cols):
                 watch = Watch(self, ["--watch=0.05", "-t", "-p", str(proc.pid)],
                               terminal=True, rows=50, cols=cols,
-                              env={**os.environ, "LC_ALL": "C.UTF-8"})
-                frame = watch.frame().decode("utf-8")
+                              env={**self.env, "LC_ALL": "C.UTF-8"})
+                frame = self.plain(watch.frame().decode("utf-8"))
                 self.assertTrue(frame.endswith(suffix), frame)
 
     def test_empty_selection_and_conflicting_output_modes(self):
