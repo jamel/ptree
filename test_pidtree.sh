@@ -28,13 +28,13 @@ bash -c 'sleep 30 & wait' &
 root_pid=$!
 
 for _ in {1..50}; do
-    if ./pidtree "$root_pid" | awk 'END { exit NR >= 2 ? 0 : 1 }'; then
+    if ./pidtree -p "$root_pid" | awk 'END { exit NR >= 2 ? 0 : 1 }'; then
         break
     fi
     sleep 0.05
 done
 
-newline_output=$(./pidtree "$root_pid")
+newline_output=$(./pidtree -p "$root_pid")
 if ! printf '%s\n' "$newline_output" | awk 'END { exit NR >= 2 ? 0 : 1 }'; then
     printf 'test process tree did not expose a child process\n' >&2
     exit 1
@@ -42,13 +42,19 @@ fi
 
 expected=$(printf '%s\n' "$newline_output" | paste -sd, -)
 
-actual_short=$(./pidtree -c "$root_pid")
+actual_pid_long=$(./pidtree --pid="$root_pid")
+if [[ "$actual_pid_long" != "$newline_output" ]]; then
+    printf 'expected --pid output: %s\nactual --pid output:   %s\n' "$newline_output" "$actual_pid_long" >&2
+    exit 1
+fi
+
+actual_short=$(./pidtree -c -p "$root_pid")
 if [[ "$actual_short" != "$expected" ]]; then
     printf 'expected -c output: %s\nactual -c output:   %s\n' "$expected" "$actual_short" >&2
     exit 1
 fi
 
-actual_long=$(./pidtree --comma "$root_pid")
+actual_long=$(./pidtree --comma --pid "$root_pid")
 if [[ "$actual_long" != "$expected" ]]; then
     printf 'expected --comma output: %s\nactual --comma output:   %s\n' "$expected" "$actual_long" >&2
     exit 1
@@ -134,3 +140,14 @@ expect_status 2 -f '['
 expect_status 2 -f
 expect_status 2 --filter
 expect_status 2 -f "$token" "$root_pid"
+expect_status 2
+expect_status 2 "$root_pid"
+expect_status 2 -- "$root_pid"
+expect_status 2 -p
+expect_status 2 --pid
+expect_status 2 -p "$root_pid" "$root_pid"
+expect_status 2 -p "$root_pid" -f "$token"
+expect_status 2 -f "$token" -p "$root_pid"
+for pid in '' 0 -1 abc 2147483648; do
+    expect_status 2 -p "$pid"
+done

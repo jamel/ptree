@@ -1,8 +1,7 @@
 /*
  * pidtree - print root PIDs and all of their descendants.
  *
- * Usage: pidtree [-c|--comma] (<pid> | -f|--filter <pattern>)
- *        pidtree -h|--help
+ * Usage: pidtree [OPTIONS] (-p <pid> | -f <pattern>)
  * Filters are extended regular expressions matched against full command lines.
  *
  * Walks /proc once to build a flat (pid, ppid) table, then BFS-traverses
@@ -250,35 +249,38 @@ static int print_trees(proc_t *procs, size_t n, int comma) {
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
 static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     *inputs = (cli_opts_t){0};
+    const char *pid_arg = NULL;
     const char *pattern = NULL;
     static const struct option options[] = {
         {"comma", no_argument, NULL, 'c'},
+        {"pid", required_argument, NULL, 'p'},
         {"filter", required_argument, NULL, 'f'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "cf:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "cp:f:h", options, NULL)) != -1) {
         switch (opt) {
         case 'c': inputs->comma = 1; break;
+        case 'p': pid_arg = optarg; break;
         case 'f': pattern = optarg; break;
         case 'h':
-            printf("usage: %s [-c|--comma] (<pid> | -f|--filter <pattern>)\n"
-                   "       %s -h|--help\n"
+            printf("usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n"
                    "\n"
                    "Print root PIDs and all of their descendants.\n"
                    "\n"
                    "Options:\n"
                    "  -c, --comma             Separate PIDs with commas instead of newlines.\n"
+                   "  -p, --pid <pid>         Select a root process by PID.\n"
                    "  -f, --filter <pattern>  Match full command lines using an extended regex.\n"
                    "  -h, --help              Display this help and exit.\n",
-                   argv[0], argv[0]);
+                   argv[0]);
             return PARSE_HELP;
         default: return PARSE_ERROR;
         }
     }
-    if (argc - optind != (pattern ? 0 : 1)) {
-        fprintf(stderr, "usage: %s [-c|--comma] (<pid> | -f|--filter <pattern>)\n", argv[0]);
+    if (optind != argc || (!pid_arg && !pattern) || (pid_arg && pattern)) {
+        fprintf(stderr, "usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n", argv[0]);
         return PARSE_ERROR;
     }
 
@@ -292,7 +294,6 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
         }
         inputs->use_filter = 1;
     } else {
-        const char *pid_arg = argv[optind];
         char *end;
         long v = strtol(pid_arg, &end, 10);
         if (*end != '\0' || v <= 0 || v > INT32_MAX) {
