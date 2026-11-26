@@ -1,7 +1,7 @@
 /*
- * pidtree - print root PIDs and all of their descendants.
+ * ptree - print root PIDs and all of their descendants.
  *
- * Usage: pidtree [OPTIONS] (-p <pid> | -f <pattern>)
+ * Usage: ptree [OPTIONS] (-p <pid> | -f <pattern>)
  * Filters are extended regular expressions matched against full command lines.
  *
  * Walks /proc once to build a flat (pid, ppid) table, then BFS-traverses

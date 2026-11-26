@@ -28,13 +28,13 @@ bash -c 'sleep 30 & wait' &
 root_pid=$!
 
 for _ in {1..50}; do
-    if ./pidtree -p "$root_pid" | awk 'END { exit NR >= 2 ? 0 : 1 }'; then
+    if ./ptree -p "$root_pid" | awk 'END { exit NR >= 2 ? 0 : 1 }'; then
         break
     fi
     sleep 0.05
 done
 
-newline_output=$(./pidtree -p "$root_pid")
+newline_output=$(./ptree -p "$root_pid")
 if ! printf '%s\n' "$newline_output" | awk 'END { exit NR >= 2 ? 0 : 1 }'; then
     printf 'test process tree did not expose a child process\n' >&2
     exit 1
@@ -42,19 +42,19 @@ fi
 
 expected=$(printf '%s\n' "$newline_output" | paste -sd, -)
 
-actual_pid_long=$(./pidtree --pid="$root_pid")
+actual_pid_long=$(./ptree --pid="$root_pid")
 if [[ "$actual_pid_long" != "$newline_output" ]]; then
     printf 'expected --pid output: %s\nactual --pid output:   %s\n' "$newline_output" "$actual_pid_long" >&2
     exit 1
 fi
 
-actual_short=$(./pidtree -c -p "$root_pid")
+actual_short=$(./ptree -c -p "$root_pid")
 if [[ "$actual_short" != "$expected" ]]; then
     printf 'expected -c output: %s\nactual -c output:   %s\n' "$expected" "$actual_short" >&2
     exit 1
 fi
 
-actual_long=$(./pidtree --comma --pid "$root_pid")
+actual_long=$(./ptree --comma --pid "$root_pid")
 if [[ "$actual_long" != "$expected" ]]; then
     printf 'expected --comma output: %s\nactual --comma output:   %s\n' "$expected" "$actual_long" >&2
     exit 1
@@ -72,7 +72,7 @@ fi
 
 # Two matching roots, each with a matching child and a nonmatching grandchild.
 # The token occurs only in argv, and overlapping matches must not duplicate PIDs.
-token="pidtree-filter-$$-$RANDOM"
+token="ptree-filter-$$-$RANDOM"
 printf -v padding '%05000d' 0
 for name in first second; do
     bash -c '
@@ -92,7 +92,7 @@ expected_filter=$(printf '%s\n' "${filter_roots[@]}"; cat "$fixture_dir/first" "
 expected_filter=$(printf '%s\n' "$expected_filter" | sort -n)
 
 for flag in -f --filter; do
-    actual=$(./pidtree "$flag" "$token" | sort -n)
+    actual=$(./ptree "$flag" "$token" | sort -n)
     if [[ "$actual" != "$expected_filter" ]]; then
         printf 'incorrect %s process forest\nexpected:\n%s\nactual:\n%s\n' "$flag" "$expected_filter" "$actual" >&2
         exit 1
@@ -101,22 +101,22 @@ done
 
 # Full-command-line matching joins argv with spaces and supports extended regexes.
 pattern=" $token-(first|second)(-child)? "
-actual=$(./pidtree -f "$pattern" | sort -n)
+actual=$(./ptree -f "$pattern" | sort -n)
 [[ "$actual" == "$expected_filter" ]]
 
 # A match beyond the initial read buffer still selects both entire trees.
-actual=$(./pidtree -f "$token-tail$" | sort -n)
+actual=$(./ptree -f "$token-tail$" | sort -n)
 [[ "$actual" == "$expected_filter" ]]
 
 expected_first=$(printf '%s\n' "${filter_roots[0]}"; cat "$fixture_dir/first")
-actual=$(./pidtree -f "$token-first " | sort -n)
+actual=$(./ptree -f "$token-first " | sort -n)
 [[ "$actual" == "$(printf '%s\n' "$expected_first" | sort -n)" ]]
 
 for args in short long; do
     if [[ "$args" == short ]]; then
-        actual=$(./pidtree -c -f "$token")
+        actual=$(./ptree -c -f "$token")
     else
-        actual=$(./pidtree --filter="$token" --comma)
+        actual=$(./ptree --filter="$token" --comma)
     fi
     [[ "$actual" != *$'\n'* && "$actual" != ,* && "$actual" != *, ]]
     [[ "$(printf '%s\n' "$actual" | tr ',' '\n' | sort -n)" == "$expected_filter" ]]
@@ -126,7 +126,7 @@ expect_status() {
     local expected_status=$1
     shift
     local status=0
-    ./pidtree "$@" > "$fixture_dir/stdout" 2> "$fixture_dir/stderr" || status=$?
+    ./ptree "$@" > "$fixture_dir/stdout" 2> "$fixture_dir/stderr" || status=$?
     if [[ "$status" != "$expected_status" ]]; then
         printf 'expected status %s, got %s for %s\n' "$expected_status" "$status" "$*" >&2
         exit 1
@@ -135,7 +135,7 @@ expect_status() {
 }
 
 expect_status 1 -f "$token-missing"
-expect_status 1 -f '^\./pidtree -f '
+expect_status 1 -f '^\./ptree -f '
 expect_status 2 -f '['
 expect_status 2 -f
 expect_status 2 --filter

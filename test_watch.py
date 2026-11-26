@@ -23,11 +23,11 @@ class Watch:
         if terminal:
             self.fd, slave = pty.openpty()
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-            self.proc = subprocess.Popen(["./pidtree", *args], stdout=slave,
+            self.proc = subprocess.Popen(["./ptree", *args], stdout=slave,
                                          stderr=subprocess.PIPE, env=env)
             os.close(slave)
         else:
-            self.proc = subprocess.Popen(["./pidtree", *args], stdout=subprocess.PIPE,
+            self.proc = subprocess.Popen(["./ptree", *args], stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, env=env)
             self.fd = self.proc.stdout.fileno()
         case.addCleanup(self.close)
@@ -151,7 +151,7 @@ class WatchTests(unittest.TestCase):
             pass
 
     def test_filter_keeps_watching_when_matches_appear_and_disappear(self):
-        token = "pidtree-watch-" + uuid.uuid4().hex
+        token = "ptree-watch-" + uuid.uuid4().hex
         watch = Watch(self, ["--watch=0.05", "-f", f"^{token} 60$"], terminal=True)
         watch.expect_frame(b"")
         root = self.process(["bash", "-c", 'exec -a "$1" sleep 60', "bash", token])
@@ -172,7 +172,7 @@ class WatchTests(unittest.TestCase):
     def test_invalid_intervals(self):
         for value in ("", "0", "-1", "abc", "1s", "nan", "inf", "1e100", "1e-100"):
             with self.subTest(interval=value):
-                result = subprocess.run(["./pidtree", f"--watch={value}", "-p", "1"],
+                result = subprocess.run(["./ptree", f"--watch={value}", "-p", "1"],
                                         capture_output=True, timeout=2)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, b"")

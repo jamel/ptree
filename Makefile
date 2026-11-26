@@ -3,8 +3,8 @@ CFLAGS ?= -std=c99 -Wall -Wextra -Wpedantic -O2
 LDFLAGS ?=
 LDLIBS ?=
 
-TARGET := pidtree
-SRC := pidtree.c
+TARGET := ptree
+SRC := ptree.c
 OBJ := $(SRC:.c=.o)
 
 .PHONY: all test clean
@@ -12,7 +12,7 @@ OBJ := $(SRC:.c=.o)
 all: $(TARGET)
 
 test: $(TARGET)
-	bash test_pidtree.sh
+	bash test_ptree.sh
 	python3 test_tree.py
 	python3 test_watch.py
 

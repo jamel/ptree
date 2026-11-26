@@ -72,7 +72,7 @@ class TreeTests(unittest.TestCase):
         return output
 
     def start_tree(self, token=None):
-        token = token or "pidtree-tree-" + uuid.uuid4().hex
+        token = token or "ptree-tree-" + uuid.uuid4().hex
         args = [sys.executable, __file__, "--fixture", token]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True,
                                 start_new_session=True)
@@ -97,7 +97,7 @@ class TreeTests(unittest.TestCase):
         return rows
 
     def run_tree(self, *args):
-        result = subprocess.run(["./pidtree", *args], capture_output=True, text=True,
+        result = subprocess.run(["./ptree", *args], capture_output=True, text=True,
                                 timeout=3, env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -171,8 +171,8 @@ class TreeTests(unittest.TestCase):
     def test_usage_colors_change_at_thresholds(self):
         # Render controlled snapshots without burning CPU or allocating RAM.
         source = r'''
-#define main pidtree_main
-#include "pidtree.c"
+#define main ptree_main
+#include "ptree.c"
 #undef main
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
@@ -231,7 +231,7 @@ int main(int argc, char **argv) {
                 ])
 
     def test_filter_forest_keeps_overlapping_matches_under_their_parents(self):
-        token = "pidtree-tree-" + uuid.uuid4().hex
+        token = "ptree-tree-" + uuid.uuid4().hex
         first, _, _ = self.start_tree(token)
         second, _, _ = self.start_tree(token)
         rows = self.run_tree("--tree", "-f", token)
@@ -346,7 +346,7 @@ int main(int argc, char **argv) {
                 self.assertGreater(resumed[-1], 0.0, resumed)
 
     def test_watch_tree_refreshes_matches_after_empty_frames(self):
-        token = "pidtree-tree-" + uuid.uuid4().hex
+        token = "ptree-tree-" + uuid.uuid4().hex
         watch = Watch(self, ["--watch=0.05", "-t", "-f", f"^{token} 60$"],
                       terminal=True, cols=1000)
         watch.expect_frame(b"")
@@ -382,11 +382,11 @@ int main(int argc, char **argv) {
                 self.assertTrue(frame.endswith(suffix), frame)
 
     def test_empty_selection_and_conflicting_output_modes(self):
-        for args, status in ((["-t", "-f", "^pidtree-tree-missing$"], 1),
+        for args, status in ((["-t", "-f", "^ptree-tree-missing$"], 1),
                              (["-ct", "-p", str(os.getpid())], 2),
                              (["--tree", "--comma", "-p", str(os.getpid())], 2)):
             with self.subTest(args=args):
-                result = subprocess.run(["./pidtree", *args], capture_output=True,
+                result = subprocess.run(["./ptree", *args], capture_output=True,
                                         timeout=3)
                 self.assertEqual(result.returncode, status)
                 self.assertEqual(result.stdout, b"")
