@@ -1,3 +1,4 @@
 *.o
 ptree
+.ptree-commit
 __pycache__/

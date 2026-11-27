@@ -7,8 +7,11 @@ LDLIBS ?=
 TARGET := ptree
 SRC := ptree.c
 OBJ := $(SRC:.c=.o)
+GIT_COMMIT := $(shell git --git-dir=.git rev-parse --short HEAD 2>/dev/null || printf unknown)
+BUILD_DATE = $(shell date +%F)
+COMMIT_STAMP := .ptree-commit
 
-.PHONY: all test bench fmt clean
+.PHONY: all test bench fmt clean FORCE
 
 all: $(TARGET)
 
@@ -24,8 +27,20 @@ fmt:
 $(TARGET): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-%.o: %.c
+$(OBJ): override CFLAGS += \
+	-DPTREE_GIT_COMMIT='"$(GIT_COMMIT)"' \
+	-DPTREE_BUILD_DATE='"$(BUILD_DATE)"'
+
+$(OBJ): %.o: %.c $(COMMIT_STAMP) Makefile
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Refresh the stamp when HEAD changes, even if the source files did not change.
+ifneq ($(GIT_COMMIT),$(shell cat $(COMMIT_STAMP) 2>/dev/null))
+$(COMMIT_STAMP): FORCE
+endif
+
+$(COMMIT_STAMP):
+	@printf '%s\n' '$(GIT_COMMIT)' > $@
+
 clean:
-	rm -f $(TARGET) $(OBJ)
+	rm -f $(TARGET) $(OBJ) $(COMMIT_STAMP)

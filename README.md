@@ -56,3 +56,7 @@ make clean   # remove build output
 
 More on benchmarks in [bench/README.md](bench/README.md). To use a specific
 clang-format, run `make fmt CLANG_FORMAT=clang-format-20`.
+
+## License
+
+[MIT](LICENSE)

@@ -29,6 +29,14 @@
 #include <unistd.h>
 #include <wchar.h>
 
+#ifndef PTREE_GIT_COMMIT
+#define PTREE_GIT_COMMIT "unknown"
+#endif
+
+#ifndef PTREE_BUILD_DATE
+#define PTREE_BUILD_DATE "unknown"
+#endif
+
 /* --- Types -------------------------------------------------------------- */
 
 typedef struct {
@@ -81,7 +89,7 @@ typedef struct {
 
 typedef enum {
 	PARSE_OK,
-	PARSE_HELP,
+	PARSE_EXIT,
 	PARSE_ERROR,
 } parse_result_t;
 
@@ -637,6 +645,7 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs)
 		{ "pid", required_argument, NULL, 'p' },
 		{ "filter", required_argument, NULL, 'f' },
 		{ "watch", optional_argument, NULL, 'w' },
+		{ "version", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -668,6 +677,12 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs)
 				interval_arg = argv[optind++];
 			}
 			break;
+		case 'v':
+			printf("ptree 1.0.0 (%s, %s)\n"
+			       "Copyright (C) 2026 Sergey Polovko <sergey@polovko.me>\n"
+			       "License MIT <https://opensource.org/license/mit>\n",
+			       PTREE_GIT_COMMIT, PTREE_BUILD_DATE);
+			return PARSE_EXIT;
 		case 'h':
 			printf("usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n"
 			       "\n"
@@ -683,9 +698,10 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs)
 			       "  -f, --filter <pattern>  Match full command lines using an extended regex.\n"
 			       "      --watch [interval]  Refresh every interval seconds (default: 5; Ctrl-C to stop).\n"
 			       "                         Tree CPU usage is measured between refreshes after the first sample.\n"
+			       "      --version           Display version information and exit.\n"
 			       "  -h, --help              Display this help and exit.\n",
 			       argv[0]);
-			return PARSE_HELP;
+			return PARSE_EXIT;
 		default:
 			return PARSE_ERROR;
 		}
@@ -923,7 +939,7 @@ int main(int argc, char **argv)
 	cli_opts_t inputs;
 	parse_result_t parsed = parse_opts(argc, argv, &inputs);
 
-	if (parsed == PARSE_HELP) {
+	if (parsed == PARSE_EXIT) {
 		return 0;
 	}
 
