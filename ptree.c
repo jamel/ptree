@@ -28,6 +28,8 @@
 #include <unistd.h>
 #include <wchar.h>
 
+/* --- Types -------------------------------------------------------------- */
+
 typedef struct {
     pid_t pid;
     pid_t ppid;
@@ -71,6 +73,8 @@ typedef enum {
     PARSE_HELP,
     PARSE_ERROR
 } parse_result_t;
+
+/* --- Growable buffer ---------------------------------------------------- */
 
 /* Make room for at least size bytes, doubling so repeated growth stays cheap. */
 static int buff_reserve(buff_t *buff, size_t size) {
@@ -123,6 +127,8 @@ static int buff_read_file(buff_t *buff, const char *path) {
     }
     return result;
 }
+
+/* --- Scanning /proc ----------------------------------------------------- */
 
 /*
  * Read the parent, CPU times, resident pages, and name from /proc/<pid>/stat.
@@ -301,6 +307,8 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
     *out_n = n;
     return 0;
 }
+
+/* --- Selection and output ----------------------------------------------- */
 
 static void print_pid(FILE *out, pid_t pid, int comma, int *printed) {
     if (comma) {
@@ -559,6 +567,8 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
     return result;
 }
 
+/* --- Command-line options ----------------------------------------------- */
+
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
 static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     *inputs = (cli_opts_t){.tree = 1, .interval = {.tv_sec = 5}};
@@ -647,6 +657,8 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     }
     return PARSE_OK;
 }
+
+/* --- Frames and main loop ----------------------------------------------- */
 
 static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previous,
                           buff_t *buff) {
