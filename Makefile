@@ -7,12 +7,15 @@ TARGET := ptree
 SRC := ptree.c
 OBJ := $(SRC:.c=.o)
 
-.PHONY: all test clean
+.PHONY: all test bench clean
 
 all: $(TARGET)
 
 test: $(TARGET)
 	python3 tests/run.py discover -s tests -v
+
+bench:
+	CC="$(CC)" CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" python3 bench/run.py
 
 $(TARGET): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
