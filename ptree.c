@@ -504,13 +504,13 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
 
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
 static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
-    *inputs = (cli_opts_t){.interval = {.tv_sec = 5}};
+    *inputs = (cli_opts_t){.tree = 1, .interval = {.tv_sec = 5}};
     const char *pid_arg = NULL;
     const char *pattern = NULL;
     const char *interval_arg = NULL;
     static const struct option options[] = {
         {"comma", no_argument, NULL, 'c'},
-        {"tree", no_argument, NULL, 't'},
+        {"list", no_argument, NULL, 'l'},
         {"pid", required_argument, NULL, 'p'},
         {"filter", required_argument, NULL, 'f'},
         {"watch", optional_argument, NULL, 'w'},
@@ -518,10 +518,10 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
         {NULL, 0, NULL, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "ctp:f:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "clp:f:h", options, NULL)) != -1) {
         switch (opt) {
-        case 'c': inputs->comma = 1; break;
-        case 't': inputs->tree = 1; break;
+        case 'c': inputs->comma = 1; inputs->tree = 0; break;
+        case 'l': inputs->tree = 0; break;
         case 'p': pid_arg = optarg; break;
         case 'f': pattern = optarg; break;
         case 'w':
@@ -534,15 +534,14 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
         case 'h':
             printf("usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n"
                    "\n"
-                   "Print root PIDs and all of their descendants.\n"
+                   "Show process trees with PID, %%CPU, %%MEM, and command by default.\n"
+                   "Color on terminals unless NO_COLOR is nonempty or TERM=dumb.\n"
+                   "CPU colors: green <50%%, yellow <90%%, red >=90%%.\n"
+                   "Memory colors: green <10%%, yellow <25%%, red >=25%%.\n"
                    "\n"
                    "Options:\n"
-                   "  -c, --comma             Separate PIDs with commas instead of newlines.\n"
-                   "  -t, --tree              Show a process tree with PID, %%CPU, %%MEM, and command.\n"
-                   "                         Color on terminals unless NO_COLOR is nonempty or TERM=dumb.\n"
-                   "                         CPU colors: green <50%%, yellow <90%%, red >=90%%.\n"
-                   "                         Memory colors: green <10%%, yellow <25%%, red >=25%%.\n"
-                   "                         Cannot be combined with --comma.\n"
+                   "  -l, --list              Show a newline-separated PID list instead of a tree.\n"
+                   "  -c, --comma             Show a comma-separated PID list instead of a tree.\n"
                    "  -p, --pid <pid>         Select a root process by PID.\n"
                    "  -f, --filter <pattern>  Match full command lines using an extended regex.\n"
                    "      --watch [interval]  Refresh every interval seconds (default: 5; Ctrl-C to stop).\n"
@@ -555,10 +554,6 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     }
     if (optind != argc || (!pid_arg && !pattern) || (pid_arg && pattern)) {
         fprintf(stderr, "usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n", argv[0]);
-        return PARSE_ERROR;
-    }
-    if (inputs->tree && inputs->comma) {
-        fprintf(stderr, "--tree and --comma cannot be combined\n");
         return PARSE_ERROR;
     }
 

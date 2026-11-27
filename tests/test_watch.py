@@ -92,7 +92,7 @@ class WatchTests(unittest.TestCase):
     def test_default_interval_and_ctrl_c(self):
         """Refresh at the default interval and exit on Ctrl+C"""
         root = self.process(["sleep", "60"])
-        watch = Watch(self, ["--watch", "-p", str(root.pid)])
+        watch = Watch(self, ["--watch", "-l", "-p", str(root.pid)])
         self.assertEqual(watch.read_until(b"\n", timeout=1), f"{root.pid}\n".encode())
         start = time.monotonic()
         self.assertEqual(watch.read_until(b"\n", timeout=7), f"{root.pid}\n".encode())
@@ -122,7 +122,7 @@ class WatchTests(unittest.TestCase):
             "print('stopped')\n"
             "sys.stdin.readline()\n",
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        watch = Watch(self, ["--watch=0.05", "-p", str(root.pid)], terminal=True)
+        watch = Watch(self, ["--watch=0.05", "-l", "-p", str(root.pid)], terminal=True)
         root_frame = f"{root.pid}\r\n".encode()
         watch.expect_frame(root_frame)
         root.stdin.write("start\n")
@@ -156,7 +156,7 @@ class WatchTests(unittest.TestCase):
     def test_filter_keeps_watching_when_matches_appear_and_disappear(self):
         """Keep watching as filter matches come and go"""
         token = "ptree-watch-" + uuid.uuid4().hex
-        watch = Watch(self, ["--watch=0.05", "-f", f"^{token} 60$"], terminal=True)
+        watch = Watch(self, ["--watch=0.05", "--list", "-f", f"^{token} 60$"], terminal=True)
         watch.expect_frame(b"")
         root = self.process(["bash", "-c", 'exec -a "$1" sleep 60', "bash", token])
         watch.expect_frame(f"{root.pid}\r\n".encode())

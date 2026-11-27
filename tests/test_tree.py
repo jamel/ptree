@@ -115,7 +115,7 @@ class TreeTests(unittest.TestCase):
     def test_terminal_tree_adds_color_without_changing_layout(self):
         """Color the terminal tree while preserving its layout"""
         pids, command, _ = self.start_tree()
-        output = self.run_terminal("-t", "-p", str(pids[0]), lines=5)
+        output = self.run_terminal("-p", str(pids[0]), lines=5)
         self.assertRegex(output, r"\x1b\[[0-9;]*3[0-7]m")
         rows = self.rows(output)
         self.assertEqual([row[0] for row in rows], pids)
@@ -130,7 +130,7 @@ class TreeTests(unittest.TestCase):
         pids, _, _ = self.start_tree()
         for override in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
             with self.subTest(override=override):
-                output = self.run_terminal("-t", "-p", str(pids[0]), lines=5,
+                output = self.run_terminal("-p", str(pids[0]), lines=5,
                                            env={**self.env, **override})
                 self.assertNotIn("\x1b", output)
                 self.assertEqual([row[0] for row in self.rows(output)], pids)
@@ -142,7 +142,7 @@ class TreeTests(unittest.TestCase):
                 proc = subprocess.Popen([executable, "60"], executable="/usr/bin/sleep")
                 self.addCleanup(proc.wait, timeout=2)
                 self.addCleanup(proc.terminate)
-                output = self.run_terminal("-t", "-p", str(proc.pid), lines=2)
+                output = self.run_terminal("-p", str(proc.pid), lines=2)
                 prefix, name = os.path.split(executable)
                 styled = "\x1b[97m" + name + "\x1b[0m 60"
                 if prefix:
@@ -162,7 +162,7 @@ class TreeTests(unittest.TestCase):
                                         stdout=subprocess.PIPE, text=True)
                 try:
                     self.assertEqual(proc.stdout.readline(), "ready\n")
-                    output = self.run_terminal("-t", "-p", str(proc.pid), lines=2)
+                    output = self.run_terminal("-p", str(proc.pid), lines=2)
                     self.assertTrue(output.endswith(
                         f"\x1b[90m/bin/sh {directory}/\x1b[97m{name}\x1b[0m\r\n"),
                         repr(output))
@@ -221,7 +221,7 @@ int main(int argc, char **argv) {
     def test_terminal_pid_lists_remain_plain(self):
         """Print PID lists in plain text even on a terminal"""
         pids, _, _ = self.start_tree()
-        for flags, lines in (([], 4), (["-c"], 1)):
+        for flags, lines in ((["-l"], 4), (["--list"], 4), (["-c"], 1), (["--comma"], 1)):
             with self.subTest(flags=flags):
                 output = self.run_terminal(*flags, "-p", str(pids[0]), lines=lines)
                 self.assertNotIn("\x1b", output)
@@ -230,20 +230,18 @@ int main(int argc, char **argv) {
     def test_pid_tree_has_depth_first_branches_and_full_commands(self):
         """Show full command lines in a depth-first tree"""
         pids, command, _ = self.start_tree()
-        for flag in ("-t", "--tree"):
-            with self.subTest(flag=flag):
-                rows = self.run_tree(flag, "-p", str(pids[0]))
-                self.assertEqual([row[0] for row in rows], pids)
-                self.assertEqual([row[3] for row in rows], [
-                    command, " \\_ " + command, " |   \\_ " + command, " \\_ " + command,
-                ])
+        rows = self.run_tree("-p", str(pids[0]))
+        self.assertEqual([row[0] for row in rows], pids)
+        self.assertEqual([row[3] for row in rows], [
+            command, " \\_ " + command, " |   \\_ " + command, " \\_ " + command,
+        ])
 
     def test_filter_forest_keeps_overlapping_matches_under_their_parents(self):
         """Keep matching descendants under their parents"""
         token = "ptree-tree-" + uuid.uuid4().hex
         first, _, _ = self.start_tree(token)
         second, _, _ = self.start_tree(token)
-        rows = self.run_tree("--tree", "-f", token)
+        rows = self.run_tree("-f", token)
         self.assertEqual([row[0] for row in rows], first + second)
         self.assertFalse(rows[0][3].startswith(" "))
         self.assertFalse(rows[4][3].startswith(" "))
@@ -251,7 +249,7 @@ int main(int argc, char **argv) {
     def test_long_commands_and_control_characters_stay_on_one_line(self):
         """Keep long commands with control characters on one line"""
         pids, command, _ = self.start_tree("x" * 5000 + "\n\t\x1btail")
-        rows = self.run_tree("-t", "-p", str(pids[0]))
+        rows = self.run_tree("-p", str(pids[0]))
         self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0][3], command.replace("\n", "?").replace("\t", "?").replace("\x1b", "?"))
 
@@ -263,7 +261,7 @@ int main(int argc, char **argv) {
         self.addCleanup(proc.wait, timeout=2)
         self.addCleanup(proc.terminate)
         time.sleep(1.1)
-        row = self.run_tree("-t", "-p", str(proc.pid))[0]
+        row = self.run_tree("-p", str(proc.pid))[0]
         expected = subprocess.check_output(
             ["ps", "-o", "pcpu=,pmem=", "-p", str(proc.pid)], text=True).split()
         self.assertGreater(row[1], 0)
@@ -292,17 +290,17 @@ int main(int argc, char **argv) {
 
         self.addCleanup(cleanup)
         child = int(proc.stdout.readline())
-        rows = self.run_tree("-t", "-p", str(child))
+        rows = self.run_tree("-p", str(child))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], child)
         self.assertEqual(rows[0][3], "[tree/) (name]")
-        output = self.run_terminal("-t", "-p", str(child), lines=2)
+        output = self.run_terminal("-p", str(child), lines=2)
         self.assertIn("[\x1b[97mtree/) (name\x1b[0m]", output)
 
     def test_watch_renders_tree_frames(self):
         """Redraw the colored process tree on each refresh"""
         pids, command, _ = self.start_tree()
-        watch = Watch(self, ["--watch=0.05", "-t", "-p", str(pids[0])],
+        watch = Watch(self, ["--watch=0.05", "-p", str(pids[0])],
                       terminal=True, rows=20, cols=1000, env=self.env)
         for _ in range(2):
             frame = watch.frame().decode()
@@ -314,7 +312,7 @@ int main(int argc, char **argv) {
     def test_watch_resets_color_when_frame_is_clipped(self):
         """Reset terminal color after clipping a frame"""
         pids, _, _ = self.start_tree()
-        watch = Watch(self, ["--watch=0.05", "-t", "-p", str(pids[0])],
+        watch = Watch(self, ["--watch=0.05", "-p", str(pids[0])],
                       terminal=True, rows=1, cols=5, env=self.env)
         frame = watch.frame().decode()
         self.assertTrue(frame.endswith("\x1b[0m"), repr(frame))
@@ -339,7 +337,7 @@ int main(int argc, char **argv) {
         for terminal in (False, True):
             with self.subTest(terminal=terminal):
                 proc.send_signal(signal.SIGCONT)
-                watch = Watch(self, ["--watch=0.05", "-t", "-p", str(proc.pid)],
+                watch = Watch(self, ["--watch=0.05", "-p", str(proc.pid)],
                               terminal=terminal, cols=1000, env=self.env)
 
                 def cpu():
@@ -363,7 +361,7 @@ int main(int argc, char **argv) {
     def test_watch_tree_refreshes_matches_after_empty_frames(self):
         """Redraw the tree when matches return after an empty frame"""
         token = "ptree-tree-" + uuid.uuid4().hex
-        watch = Watch(self, ["--watch=0.05", "-t", "-f", f"^{token} 60$"],
+        watch = Watch(self, ["--watch=0.05", "-f", f"^{token} 60$"],
                       terminal=True, cols=1000)
         watch.expect_frame(b"")
         for _ in range(2):
@@ -392,17 +390,17 @@ int main(int argc, char **argv) {
         for cols, suffix in ((command_column + 1, "é\r\né界e\u0301 60\r\n"),
                              (2, narrow_prefix + "\r\n界\r\ne\u0301 \r\n60\r\n")):
             with self.subTest(cols=cols):
-                watch = Watch(self, ["--watch=0.05", "-t", "-p", str(proc.pid)],
+                watch = Watch(self, ["--watch=0.05", "-p", str(proc.pid)],
                               terminal=True, rows=50, cols=cols,
                               env={**self.env, "LC_ALL": "C.UTF-8"})
                 frame = self.plain(watch.frame().decode("utf-8"))
                 self.assertTrue(frame.endswith(suffix), frame)
 
-    def test_empty_selection_and_conflicting_output_modes(self):
-        """Report no matches and reject combining --tree and --comma"""
-        for args, status in ((["-t", "-f", "^ptree-tree-missing$"], 1),
-                             (["-ct", "-p", str(os.getpid())], 2),
-                             (["--tree", "--comma", "-p", str(os.getpid())], 2)):
+    def test_empty_selection_and_removed_tree_options(self):
+        """Report no matches and reject removed tree options"""
+        for args, status in ((["-f", "^ptree-tree-missing$"], 1),
+                             (["-t", "-p", str(os.getpid())], 2),
+                             (["--tree", "-p", str(os.getpid())], 2)):
             with self.subTest(args=args):
                 result = subprocess.run(["./ptree", *args], capture_output=True,
                                         timeout=3)

@@ -66,14 +66,19 @@ class PtreeTests(unittest.TestCase):
             self.assertEqual(result.stderr, "")
         return result.stdout
 
+    def tree_pids(self, output):
+        lines = output.splitlines()
+        self.assertEqual(lines[0].split(), ["PID", "%CPU", "%MEM", "COMMAND"])
+        return [line.split()[0] for line in lines[1:]]
+
     def test_pid_options_select_root_and_descendants_in_order(self):
         """List the selected PID and its descendants in order"""
         pids = self.start_tree()
         root = str(pids[0])
-        expected = "".join(f"{pid}\n" for pid in pids)
+        expected = list(map(str, pids))
         for args in (["-p", root], ["--pid", root], [f"--pid={root}"]):
             with self.subTest(args=args):
-                self.assertEqual(self.run_ptree(*args), expected)
+                self.assertEqual(self.tree_pids(self.run_ptree(*args)), expected)
 
     def test_pid_comma_options(self):
         """Print descendants as a comma-separated PID list"""
@@ -84,33 +89,58 @@ class PtreeTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(self.run_ptree(*args), expected)
 
+    def test_comma_wins_over_list_in_either_order(self):
+        """Print a comma-separated list when both list flags are given"""
+        pids = self.start_tree()
+        root = str(pids[0])
+        expected = ",".join(map(str, pids)) + "\n"
+        for args in (["-l", "-c", "-p", root], ["-c", "-l", "-p", root]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_ptree(*args), expected)
+
+    def test_pid_list_options(self):
+        """Print the selected PID and descendants one per line"""
+        pids = self.start_tree()
+        expected = "".join(f"{pid}\n" for pid in pids)
+        for flag in ("-l", "--list"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.run_ptree(flag, "-p", str(pids[0])), expected)
+
+    def test_filter_list_options(self):
+        """Print matching processes and descendants one per line"""
+        pids = self.start_forest()
+        for flag in ("-l", "--list"):
+            with self.subTest(flag=flag):
+                output = self.run_ptree(flag, "-f", self.token)
+                self.assertCountEqual(output.splitlines(), list(map(str, pids)))
+
     def test_filter_options_include_descendants_without_duplicates(self):
         """Include each matching process and descendant once"""
         pids = self.start_forest()
         for flag in ("-f", "--filter"):
             with self.subTest(flag=flag):
                 output = self.run_ptree(flag, self.token)
-                self.assertCountEqual(output.splitlines(), list(map(str, pids)))
+                self.assertCountEqual(self.tree_pids(output), list(map(str, pids)))
 
     def test_filter_matches_full_command_line_with_extended_regex(self):
         """Match full command lines with extended regex"""
         pids = self.start_forest()
         pattern = f" {self.token}-(first|second)(-child)? "
         output = self.run_ptree("-f", pattern)
-        self.assertCountEqual(output.splitlines(), list(map(str, pids)))
+        self.assertCountEqual(self.tree_pids(output), list(map(str, pids)))
 
     def test_filter_matches_beyond_initial_read_buffer(self):
         """Match the end of long command lines"""
         pids = self.start_forest()
         output = self.run_ptree("-f", self.token + "-tail$")
-        self.assertCountEqual(output.splitlines(), list(map(str, pids)))
+        self.assertCountEqual(self.tree_pids(output), list(map(str, pids)))
 
     def test_filter_selects_only_matching_tree(self):
         """List only the matching process tree"""
         pids = self.start_tree("first")
         self.start_tree("second")
         output = self.run_ptree("-f", self.token + "-first ")
-        self.assertCountEqual(output.splitlines(), list(map(str, pids)))
+        self.assertCountEqual(self.tree_pids(output), list(map(str, pids)))
 
     def test_filter_comma_options(self):
         """Print filter results as a comma-separated PID list"""
