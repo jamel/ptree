@@ -68,7 +68,7 @@ class PtreeTests(unittest.TestCase):
 
     def tree_pids(self, output):
         lines = output.splitlines()
-        self.assertEqual(lines[0].split(), ["PID", "%CPU", "%MEM", "COMMAND"])
+        self.assertEqual(lines[0].split(), ["PID", "%CPU", "RSS", "COMMAND"])
         return [line.split()[0] for line in lines[1:]]
 
     def test_pid_options_select_root_and_descendants_in_order(self):

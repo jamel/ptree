@@ -127,8 +127,8 @@ static int fixture_open(const char *path, int flags) {
 static long fixture_sysconf(int name) {
     switch (name) {
     case _SC_CLK_TCK: return 100;
-    case _SC_PHYS_PAGES: return 10000;
     case _SC_NPROCESSORS_ONLN: return 8;
+    case _SC_PAGESIZE: return 4096;
     default: return sysconf(name);
     }
 }
@@ -147,6 +147,19 @@ static int run(int argc, char **argv, buff_t *buff) {
         freelocale(caller);
         if (!restored) fputs("redraw did not restore the caller locale\n", stderr);
         return restored ? 0 : 1;
+    }
+    if (strcmp(argv[1], "sizes") == 0) {
+        static const unsigned long long sizes[] = {
+            0, 1023, 1024, 10188, 10189, 10240, 1048063, 1048064, 1048576,
+            1610612736, 10737418240ULL, 1099511627776ULL, 1125899906842624ULL,
+            18446744073709551615ULL,
+        };
+        for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); i++) {
+            char text[32];
+            format_size(text, sizeof(text), sizes[i]);
+            puts(text);
+        }
+        return 0;
     }
     proc_t procs[] = {
         {.pid = 60, .ppid = 20},
@@ -300,14 +313,14 @@ class SnapshotTests(unittest.TestCase):
     def test_shuffled_roots_render_sorted_depth_first_branches(self):
         """Sort tree siblings while retaining overlapping, missing, and self parents"""
         self.assertEqual(self.run_snapshot("tree"),
-                         "    PID  %CPU  %MEM COMMAND\n"
-                         "     10  10.0   1.0 [process]\n"
-                         "     20  10.0   1.0  \\_ [process]\n"
-                         "     40  10.0   1.0      \\_ [process]\n"
-                         "     50  10.0   1.0      |   \\_ [process]\n"
-                         "     60  10.0   1.0      \\_ [process]\n"
-                         "     70  10.0   1.0 [process]\n"
-                         "     90  10.0   1.0 [process]\n")
+                         "    PID  %CPU   RSS COMMAND\n"
+                         "     10  10.0  400K [process]\n"
+                         "     20  10.0  400K  \\_ [process]\n"
+                         "     40  10.0  400K      \\_ [process]\n"
+                         "     50  10.0  400K      |   \\_ [process]\n"
+                         "     60  10.0  400K      \\_ [process]\n"
+                         "     70  10.0  400K [process]\n"
+                         "     90  10.0  400K [process]\n")
 
     def test_repeated_scan_entries_are_listed_without_looping(self):
         """List a PID the scan reported twice without relinking its children"""
@@ -316,10 +329,10 @@ class SnapshotTests(unittest.TestCase):
     def test_roots_exclude_unselected_siblings(self):
         """Render selected roots without their unselected parent's other children"""
         self.assertEqual(self.run_snapshot("siblings"),
-                         "    PID  %CPU  %MEM COMMAND\n"
-                         "     20   0.0   0.0 []\n"
-                         "     50   0.0   0.0  \\_ []\n"
-                         "     40   0.0   0.0 []\n")
+                         "    PID  %CPU   RSS COMMAND\n"
+                         "     20   0.0     0 []\n"
+                         "     50   0.0     0  \\_ []\n"
+                         "     40   0.0     0 []\n")
 
     def test_out_of_memory_stops_with_status_one(self):
         """Report an allocation failure and exit with status 1"""
@@ -327,6 +340,13 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"ptree: out of memory\n")
+
+    def test_sizes_use_binary_units_with_at_most_five_columns(self):
+        """Format byte counts with K, M, G, and T at unit and rounding boundaries"""
+        self.assertEqual(self.run_snapshot("sizes").splitlines(), [
+            "0", "1023", "1.0K", "9.9K", "10K", "10K", "1023K", "1.0M", "1.0M",
+            "1.5G", "10G", "1.0T", "1024T", "16777216T",
+        ])
 
     def test_system_values_are_read_once_per_run(self):
         """Read pid_max once for all the frames of a run"""
@@ -359,8 +379,8 @@ class SnapshotTests(unittest.TestCase):
     def test_command_filter_does_not_reuse_empty_or_unreadable_contents(self):
         """Do not match stale command contents while filtering a process scan"""
         self.assertEqual(self.run_snapshot("commands-filter"),
-                         "    PID  %CPU  %MEM COMMAND\n"
-                         "     20   2.0   1.0 short\n")
+                         "    PID  %CPU   RSS COMMAND\n"
+                         "     20   2.0  400K short\n")
 
     def test_command_highlighting_survives_buffer_reuse(self):
         """Preserve command highlighting after buffer growth and empty reads"""

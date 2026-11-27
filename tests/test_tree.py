@@ -14,6 +14,15 @@ from pathlib import Path
 
 from test_watch import Watch
 
+SIZE = r"\d+(?:\.\d)?[KMGT]?"
+
+
+def size_bytes(text):
+    """Convert an RSS value such as 0, 4.0K, or 512M to bytes."""
+    if text[-1] in "KMGT":
+        return float(text[:-1]) * 1024 ** ("KMGT".index(text[-1]) + 1)
+    return float(text)
+
 
 def stop_fixture(signum, frame):
     raise SystemExit(0)
@@ -65,7 +74,7 @@ class TreeTests(unittest.TestCase):
         self.max_cpu = os.sysconf("SC_NPROCESSORS_ONLN") * 100
         self.cpu_width = len(f"{self.max_cpu:.1f}")
         self.header = (f"{'PID':>{self.pid_width}} {'%CPU':>{self.cpu_width}} "
-                       f"{'%MEM':>5} COMMAND")
+                       f"{'RSS':>5} COMMAND")
 
     def plain(self, output):
         output = re.sub(r"\x1b\[[0-9;]*m", "", output)
@@ -92,9 +101,9 @@ class TreeTests(unittest.TestCase):
         self.assertEqual(lines[0], self.header)
         rows = []
         for line in lines[1:]:
-            match = re.fullmatch(r"\s*(\d+)\s+(\d+\.\d)\s+(\d+\.\d) (.*)", line)
+            match = re.fullmatch(rf"\s*(\d+)\s+(\d+\.\d)\s+({SIZE}) (.*)", line)
             self.assertIsNotNone(match, line)
-            rows.append((int(match[1]), float(match[2]), float(match[3]), match[4]))
+            rows.append((int(match[1]), float(match[2]), size_bytes(match[3]), match[4]))
         return rows
 
     def run_tree(self, *args):
@@ -183,11 +192,11 @@ class TreeTests(unittest.TestCase):
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     long ticks = sysconf(_SC_CLK_TCK);
-    long pages = sysconf(_SC_PHYS_PAGES);
     proc_t old = {.pid = getpid(), .selected = 1, .starttime = 1};
     proc_t proc = old;
     proc.utime = (unsigned long long)ticks * strtoul(argv[1], NULL, 10);
-    proc.rss = (pages * strtol(argv[2], NULL, 10) + 99) / 100;
+    /* Whole MiB are whole pages for every Linux page size. */
+    proc.rss = (strtol(argv[2], NULL, 10) << 20) / sysconf(_SC_PAGESIZE);
     snapshot_t previous = {.procs = &old, .n = 1, .sampled_at = {.tv_sec = 1}};
     snapshot_t current = {.procs = &proc, .n = 1, .sampled_at = {.tv_sec = 101}};
     buff_t buff = {0};
@@ -209,16 +218,19 @@ int main(int argc, char **argv) {
                 "-I", str(Path(__file__).resolve().parent.parent), path, "-o", binary,
             ], capture_output=True, text=True, timeout=30)
             self.assertEqual(build.returncode, 0, build.stderr)
-            for cpu, mem, cpu_color, mem_color in (
-                    (0, 0, 32, 32), (49, 9, 32, 32), (50, 10, 33, 33),
-                    (89, 24, 33, 33), (90, 25, 31, 31), (200, 80, 31, 31),
-                    (0, 25, 32, 31), (90, 0, 31, 32),
-                    (100, 100, 31, 31), (self.max_cpu, 100, 31, 31)):
+            # RSS is given in MiB.
+            for cpu, mem, cpu_color, mem_color, rss in (
+                    (0, 0, 32, 32, "0"), (49, 99, 32, 32, "99M"),
+                    (50, 100, 33, 33, "100M"), (89, 1023, 33, 33, "1023M"),
+                    (90, 1024, 31, 31, "1.0G"), (200, 4096, 31, 31, "4.0G"),
+                    (0, 1024, 32, 31, "1.0G"), (90, 0, 31, 32, "0"),
+                    (100, 100, 31, 33, "100M"),
+                    (self.max_cpu, 1024 * 1024, 31, 31, "1.0T")):
                 with self.subTest(cpu=cpu, mem=mem):
                     output = subprocess.check_output([binary, str(cpu), str(mem)],
                                                      text=True, timeout=3)
                     self.assertIn(f"\x1b[{cpu_color}m{cpu:{self.cpu_width}.1f}\x1b[0m "
-                                  f"\x1b[{mem_color}m{mem:5.1f}\x1b[0m", output)
+                                  f"\x1b[{mem_color}m{rss:>5}\x1b[0m", output)
                     header, row = self.plain(output).splitlines()
                     self.assertEqual(header, self.header)
                     self.assertEqual(row.index(binary), header.index("COMMAND"))
@@ -258,8 +270,8 @@ int main(int argc, char **argv) {
         self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0][3], command.replace("\n", "?").replace("\t", "?").replace("\x1b", "?"))
 
-    def test_cpu_and_memory_percentages_are_similar_to_ps(self):
-        """Report CPU and memory usage close to ps"""
+    def test_cpu_and_resident_memory_are_similar_to_ps(self):
+        """Report CPU usage and resident memory close to ps"""
         proc = subprocess.Popen([sys.executable, "-c",
                                  "import time; data = bytearray(16000000); "
                                  "exec('while True: pass')"])
@@ -268,10 +280,11 @@ int main(int argc, char **argv) {
         time.sleep(1.1)
         row = self.run_tree("-p", str(proc.pid))[0]
         expected = subprocess.check_output(
-            ["ps", "-o", "pcpu=,pmem=", "-p", str(proc.pid)], text=True).split()
+            ["ps", "-o", "pcpu=,rss=", "-p", str(proc.pid)], text=True).split()
         self.assertGreater(row[1], 0)
         self.assertAlmostEqual(row[1], float(expected[0]), delta=20)
-        self.assertAlmostEqual(row[2], float(expected[1]), delta=0.1)
+        rss = int(expected[1]) * 1024
+        self.assertAlmostEqual(row[2], rss, delta=rss * 0.06)
 
     def test_empty_command_line_uses_name_with_parentheses(self):
         """Show process names with parentheses for empty command lines"""

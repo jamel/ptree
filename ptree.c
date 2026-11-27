@@ -83,7 +83,7 @@ typedef struct {
 	int watch;
 	struct timespec interval;
 	/* System values for tree output, read once per run by read_system. */
-	long ticks, pages;
+	long ticks, page_size;
 	int pid_width, cpu_width, mem_width;
 } cli_opts_t;
 
@@ -425,6 +425,31 @@ static const char *usage_color(double value, double yellow, double red)
 	return "\033[32m";
 }
 
+/*
+ * Format a byte count in 1024-based units as ls -h does: no suffix below 1K,
+ * one decimal below 10, and whole numbers above. A value that would round to
+ * 1024 takes the next unit, so sizes below 1024T fit in five columns.
+ */
+static void format_size(char *text, size_t size, unsigned long long bytes)
+{
+	static const char units[] = "KMGT";
+
+	if (bytes < 1024) {
+		snprintf(text, size, "%llu", bytes);
+		return;
+	}
+
+	double value = (double)bytes / 1024;
+	size_t unit = 0;
+	while (value >= 1023.5 && unit + 1 < sizeof(units) - 1) {
+		value /= 1024;
+		unit++;
+	}
+
+	snprintf(text, size, "%.*f%c", value < 9.95 ? 1 : 0, value,
+		 units[unit]);
+}
+
 static double cpu_usage(const proc_t *proc, const snapshot_t *previous,
 			long ticks, double uptime, double interval)
 {
@@ -485,7 +510,7 @@ static int print_forest(FILE *out, const cli_opts_t *inputs,
 	const char *reset = color ? "\033[0m" : "";
 	fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
 		inputs->pid_width, "PID", inputs->cpu_width, "%CPU",
-		inputs->mem_width, "%MEM", "COMMAND", reset);
+		inputs->mem_width, "RSS", "COMMAND", reset);
 
 	size_t depth = 0, root = 0;
 	for (size_t cur = nroots ? roots[0] : SIZE_MAX; cur != SIZE_MAX;) {
@@ -495,15 +520,21 @@ static int print_forest(FILE *out, const cli_opts_t *inputs,
 					    color ? &name : NULL);
 		double cpu = cpu_usage(proc, previous, inputs->ticks, uptime,
 				       interval);
-		double mem = proc->rss > 0 ? 100.0 * proc->rss / inputs->pages :
-					     0;
-		fprintf(out, "%s%*d%s %s%*.1f%s %s%*.1f%s ",
+		unsigned long long bytes = 0;
+		if (proc->rss > 0) {
+			bytes = (unsigned long long)proc->rss *
+				(unsigned long long)inputs->page_size;
+		}
+		char rss[16];
+		format_size(rss, sizeof(rss), bytes);
+		fprintf(out, "%s%*d%s %s%*.1f%s %s%*s%s ",
 			color ? "\033[36m" : "", inputs->pid_width,
 			(int)proc->pid, reset,
 			color ? usage_color(cpu, 50, 90) : "",
 			inputs->cpu_width, cpu, reset,
-			color ? usage_color(mem, 10, 25) : "",
-			inputs->mem_width, mem, reset);
+			color ? usage_color((double)bytes, 100 << 20, 1 << 30) :
+				"",
+			inputs->mem_width, rss, reset);
 		if (color && depth) {
 			fputs("\033[2m", out);
 		}
@@ -686,10 +717,11 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs)
 		case 'h':
 			printf("usage: %s [OPTIONS] (-p <pid> | -f <pattern>)\n"
 			       "\n"
-			       "Show process trees with PID, %%CPU, %%MEM, and command by default.\n"
+			       "Show process trees with PID, %%CPU, RSS, and command by default.\n"
+			       "RSS is resident memory in 1024-based units: K, M, G, T.\n"
 			       "Color on terminals unless NO_COLOR is nonempty or TERM=dumb.\n"
 			       "CPU colors: green <50%%, yellow <90%%, red >=90%%.\n"
-			       "Memory colors: green <10%%, yellow <25%%, red >=25%%.\n"
+			       "Memory colors: green <100M, yellow <1G, red >=1G.\n"
 			       "\n"
 			       "Options:\n"
 			       "  -l, --list              Show a newline-separated PID list instead of a tree.\n"
@@ -908,10 +940,10 @@ static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous,
 static int read_system(cli_opts_t *inputs, buff_t *buff)
 {
 	inputs->ticks = sysconf(_SC_CLK_TCK);
-	inputs->pages = sysconf(_SC_PHYS_PAGES);
+	inputs->page_size = sysconf(_SC_PAGESIZE);
 	long ncores = sysconf(_SC_NPROCESSORS_ONLN);
 
-	if (inputs->ticks <= 0 || inputs->pages <= 0 || ncores <= 0) {
+	if (inputs->ticks <= 0 || inputs->page_size <= 0 || ncores <= 0) {
 		errno = EIO;
 		return -1;
 	}
@@ -929,7 +961,7 @@ static int read_system(cli_opts_t *inputs, buff_t *buff)
 	}
 
 	inputs->cpu_width = snprintf(NULL, 0, "%.1f", ncores * 100.0);
-	inputs->mem_width = snprintf(NULL, 0, "%.1f", 100.0);
+	inputs->mem_width = (int)strlen("1023K"); /* widest below 1024T */
 
 	return 0;
 }
