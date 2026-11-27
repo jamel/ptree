@@ -90,6 +90,7 @@ class WatchTests(unittest.TestCase):
         return proc
 
     def test_default_interval_and_ctrl_c(self):
+        """Refresh at the default interval and exit on Ctrl+C"""
         root = self.process(["sleep", "60"])
         watch = Watch(self, ["--watch", "-p", str(root.pid)])
         self.assertEqual(watch.read_until(b"\n", timeout=1), f"{root.pid}\n".encode())
@@ -100,6 +101,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(watch.proc.wait(timeout=1), -signal.SIGINT)
 
     def test_explicit_intervals_and_plain_redirected_output(self):
+        """Use custom refresh intervals with plain redirected output"""
         root = self.process(["sleep", "60"])
         for args in (["--watch", "0.05"], ["--watch=0.05"]):
             with self.subTest(args=args):
@@ -108,6 +110,7 @@ class WatchTests(unittest.TestCase):
                     self.assertEqual(watch.read_until(b"\n"), f"{root.pid}\n".encode())
 
     def test_terminal_refreshes_children_and_clears_shorter_frames(self):
+        """Update child PIDs and clear stale terminal rows"""
         root = self.process([
             sys.executable, "-u", "-c",
             "import subprocess, sys\n"
@@ -151,6 +154,7 @@ class WatchTests(unittest.TestCase):
             pass
 
     def test_filter_keeps_watching_when_matches_appear_and_disappear(self):
+        """Keep watching as filter matches come and go"""
         token = "ptree-watch-" + uuid.uuid4().hex
         watch = Watch(self, ["--watch=0.05", "-f", f"^{token} 60$"], terminal=True)
         watch.expect_frame(b"")
@@ -162,6 +166,7 @@ class WatchTests(unittest.TestCase):
         self.assertIsNone(watch.proc.poll())
 
     def test_terminal_wraps_and_clips_to_screen_size(self):
+        """Wrap and clip output to fit the terminal"""
         root = self.process(["sleep", "60"])
         watch = Watch(self, ["--watch=0.05", "-c", "-p", str(root.pid)],
                       terminal=True, rows=2, cols=1)
@@ -170,6 +175,7 @@ class WatchTests(unittest.TestCase):
         watch.expect_frame("\r\n".join(str(root.pid)[:3]).encode())
 
     def test_invalid_intervals(self):
+        """Reject invalid refresh intervals"""
         for value in ("", "0", "-1", "abc", "1s", "nan", "inf", "1e100", "1e-100"):
             with self.subTest(interval=value):
                 result = subprocess.run(["./ptree", f"--watch={value}", "-p", "1"],

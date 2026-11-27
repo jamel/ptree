@@ -12,9 +12,7 @@ OBJ := $(SRC:.c=.o)
 all: $(TARGET)
 
 test: $(TARGET)
-	python3 test_ptree.py
-	python3 test_tree.py
-	python3 test_watch.py
+	python3 tests/run.py discover -s tests -v
 
 $(TARGET): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
