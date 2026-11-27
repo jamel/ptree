@@ -338,6 +338,46 @@ static const char *usage_color(double value, double yellow, double red) {
     return "\033[32m";
 }
 
+static size_t forest_roots(proc_t *procs, size_t n) {
+    /* Children are already linked in PID order. Only selected processes whose
+     * parent is absent or unselected become roots of the displayed forest. */
+    size_t root = SIZE_MAX;
+    for (size_t i = n; i-- > 0;) {
+        if (!procs[i].selected) {
+            continue;
+        }
+        size_t parent = find_proc(procs, n, procs[i].ppid);
+        if (parent != SIZE_MAX && parent != i && procs[parent].selected) {
+            continue;
+        }
+        procs[i].sibling = root;
+        root = i;
+    }
+    return root;
+}
+
+static double cpu_usage(const proc_t *proc, const snapshot_t *previous,
+                        long ticks, double uptime, double interval) {
+    /* Watch frames use the CPU time consumed since the last scan. */
+    if (interval > 0) {
+        size_t index = find_proc(previous->procs, previous->n, proc->pid);
+        if (index != SIZE_MAX) {
+            const proc_t *old = &previous->procs[index];
+            /* A reused PID belongs to a different process. */
+            if (old->starttime == proc->starttime &&
+                proc->utime >= old->utime && proc->stime >= old->stime) {
+                double used = (double)(proc->utime - old->utime)
+                              + (double)(proc->stime - old->stime);
+                return 100.0 * used / ticks / interval;
+            }
+        }
+    }
+    /* One-shot output and a process's first sample use the lifetime average. */
+    double elapsed = uptime - (double)proc->starttime / ticks;
+    return elapsed > 0 ? 100.0 * ((double)proc->utime + proc->stime) / ticks / elapsed : 0;
+}
+
+/* The current table is sorted by PID and its children are already linked. */
 static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previous,
                         int color) {
     proc_t *procs = current->procs;
@@ -383,20 +423,7 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
         return -1;
     }
 
-    /* Children are already linked in PID order. Only selected processes whose
-     * parent is absent or unselected become roots of the displayed forest. */
-    size_t root = SIZE_MAX;
-    for (size_t i = n; i-- > 0;) {
-        if (!procs[i].selected) {
-            continue;
-        }
-        size_t parent = find_proc(procs, n, procs[i].ppid);
-        if (parent != SIZE_MAX && parent != i && procs[parent].selected) {
-            continue;
-        }
-        procs[i].sibling = root;
-        root = i;
-    }
+    size_t root = forest_roots(procs, n);
 
     const char *reset = color ? "\033[0m" : "";
     fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
@@ -410,23 +437,7 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             free(ancestors);
             return -1;
         }
-        /* Use the lifetime average for one-shot output and a process's first
-         * sample. Watch frames use CPU time consumed since the last scan. */
-        double elapsed = uptime - (double)proc->starttime / ticks;
-        double cpu = elapsed > 0 ? 100.0 * ((double)proc->utime + proc->stime) / ticks / elapsed : 0;
-        if (interval > 0) {
-            size_t index = find_proc(previous->procs, previous->n, proc->pid);
-            if (index != SIZE_MAX) {
-                const proc_t *old = &previous->procs[index];
-                /* A reused PID belongs to a different process. */
-                if (old->starttime == proc->starttime &&
-                    proc->utime >= old->utime && proc->stime >= old->stime) {
-                    double used = (double)(proc->utime - old->utime)
-                                  + (double)(proc->stime - old->stime);
-                    cpu = 100.0 * used / ticks / interval;
-                }
-            }
-        }
+        double cpu = cpu_usage(proc, previous, ticks, uptime, interval);
         double mem = proc->rss > 0 ? 100.0 * proc->rss / pages : 0;
         fprintf(out, "%s%*d%s %s%*.1f%s %s%*.1f%s ",
                 color ? "\033[36m" : "", pid_width, (int)proc->pid, reset,
