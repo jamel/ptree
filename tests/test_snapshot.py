@@ -13,12 +13,15 @@ SOURCE = r'''
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
+static pid_t fixture_getpid(void);
 static int fixture_scan;
+static int fixture_commands;
 static DIR *fixture_opendir(const char *path);
 static struct dirent *fixture_readdir(DIR *dir);
 static int fixture_closedir(DIR *dir);
 static FILE *fixture_fopen(const char *path, const char *mode);
 static long fixture_sysconf(int name);
+#define getpid fixture_getpid
 #define opendir fixture_opendir
 #define readdir fixture_readdir
 #define closedir fixture_closedir
@@ -32,6 +35,11 @@ static long fixture_sysconf(int name);
 #undef opendir
 #undef readdir
 #undef closedir
+#undef getpid
+
+static pid_t fixture_getpid(void) {
+    return 1000000; /* The harness is outside the synthetic process table. */
+}
 
 static DIR *fixture_opendir(const char *path) {
     return fixture_scan ? (DIR *)&fixture_scan : opendir(path);
@@ -56,6 +64,28 @@ static FILE *fixture_fopen(const char *path, const char *mode) {
     static char limit[] = "4194304\n";
     if (strcmp(path, "/proc/uptime") == 0) return fmemopen(uptime, sizeof(uptime) - 1, mode);
     if (strcmp(path, "/proc/sys/kernel/pid_max") == 0) return fmemopen(limit, sizeof(limit) - 1, mode);
+    if (fixture_commands && strstr(path, "/cmdline")) {
+        static char long_command[5006];
+        static char short_command[] = "short";
+        static char empty[] = "";
+        static char control[] = "line\nbreak";
+        static char before[] = "before";
+        static char after[] = "after";
+        static int changed;
+        int pid = atoi(path + 6);
+        switch (pid) {
+        case 10:
+            memset(long_command, 'x', 5000);
+            memcpy(long_command + 5000, "\0tail", 6);
+            return fmemopen(long_command, sizeof(long_command), mode);
+        case 20: return fmemopen(short_command, sizeof(short_command), mode);
+        case 30: return fmemopen(empty, sizeof(empty), mode);
+        case 50: return fmemopen(control, sizeof(control), mode);
+        case 60:
+            if (changed++) return fmemopen(after, sizeof(after), mode);
+            return fmemopen(before, sizeof(before), mode);
+        }
+    }
     if (fixture_scan && strstr(path, "/stat")) {
         static char stat[256];
         int pid = atoi(path + 6);
@@ -96,6 +126,26 @@ int main(int argc, char **argv) {
         strcpy(procs[i].comm, "process");
     }
     snapshot_t current = {.procs = procs, .n = n, .sampled_at = {.tv_sec = 10}};
+    if (strncmp(argv[1], "commands", 8) == 0) {
+        fixture_commands = 1;
+        if (strcmp(argv[1], "commands-filter") == 0) {
+            fixture_scan = 1;
+            cli_opts_t inputs = {.tree = 1, .use_filter = 1};
+            if (regcomp(&inputs.filter, "^short$", REG_EXTENDED | REG_NOSUB) != 0) return 2;
+            int result = print_snapshot(&inputs, stdout, NULL);
+            regfree(&inputs.filter);
+            return result;
+        }
+        current.n = 6;
+        for (size_t i = 0; i < current.n; i++) {
+            procs[i].pid = (pid_t)(i + 1) * 10;
+            procs[i].ppid = 0;
+            procs[i].selected = 1;
+        }
+        int color = strcmp(argv[1], "commands-color") == 0;
+        if (print_trees(stdout, &current, 0, 1, color, NULL) != 0) return 1;
+        return print_trees(stdout, &current, 0, 1, color, NULL);
+    }
     if (strncmp(argv[1], "cpu", 3) == 0) {
         current.n = 6;
         for (size_t i = 0; i < current.n; i++) {
@@ -186,3 +236,24 @@ class SnapshotTests(unittest.TestCase):
     def test_cpu_history_after_empty_frame_keeps_all_discovered_processes(self):
         """Use the prior sample after an empty frame with shuffled discovery"""
         self.assertEqual(self.cpu_values("cpu-after-empty-frame"), [900, 800, 700, 700, 500, 400])
+
+    def test_commands_remain_fresh_after_long_empty_and_unreadable_reads(self):
+        """Render fresh commands across long, short, empty, and unavailable reads"""
+        lines = self.run_snapshot("commands").splitlines()
+        commands = [line.split(maxsplit=3)[3] for line in lines if "COMMAND" not in line]
+        expected = ["x" * 5000 + " tail", "short", "[process]", "[process]", "line?break", "before"]
+        self.assertEqual(commands, expected + expected[:-1] + ["after"])
+
+    def test_command_filter_does_not_reuse_empty_or_unreadable_contents(self):
+        """Do not match stale command contents while filtering a process scan"""
+        self.assertEqual(self.run_snapshot("commands-filter"),
+                         "    PID  %CPU  %MEM COMMAND\n"
+                         "     20   2.0   1.0 short\n")
+
+    def test_command_highlighting_survives_buffer_reuse(self):
+        """Preserve command highlighting after buffer growth and empty reads"""
+        import re
+        colored = self.run_snapshot("commands-color")
+        self.assertIn("\x1b[97mshort\x1b[0m", colored)
+        self.assertIn("[\x1b[97mprocess\x1b[0m]", colored)
+        self.assertEqual(re.sub(r"\x1b\[[0-9;]*m", "", colored), self.run_snapshot("commands"))

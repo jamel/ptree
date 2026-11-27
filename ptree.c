@@ -48,6 +48,11 @@ typedef struct {
 } command_name_t;
 
 typedef struct {
+    char *data;
+    size_t cap;
+} command_buffer_t;
+
+typedef struct {
     pid_t root;
     int comma;
     int tree;
@@ -125,8 +130,10 @@ static int is_all_digits(const char *s) {
     return 1;
 }
 
-/* The caller frees *out; unreadable command lines leave it NULL. */
-static int read_cmdline(pid_t pid, char **out, const char *comm, command_name_t *name) {
+/* *out borrows buffer storage until the next read; unreadable lines leave it
+ * NULL. The caller owns buffer->data and may reuse its capacity across reads. */
+static int read_cmdline(pid_t pid, command_buffer_t *buffer, char **out,
+                        const char *comm, command_name_t *name) {
     *out = NULL;
     if (name) {
         *name = (command_name_t){0};
@@ -138,12 +145,16 @@ static int read_cmdline(pid_t pid, char **out, const char *comm, command_name_t 
         return 0;
     }
 
-    size_t cap = 4096, n = 0;
-    char *cmdline = malloc(cap);
-    if (!cmdline) {
-        fclose(f);
-        return -1;
+    if (!buffer->data) {
+        buffer->data = malloc(4096);
+        if (!buffer->data) {
+            fclose(f);
+            return -1;
+        }
+        buffer->cap = 4096;
     }
+    size_t cap = buffer->cap, n = 0;
+    char *cmdline = buffer->data;
 
     size_t count;
     while ((count = fread(cmdline + n, 1, cap - n - 1, f)) > 0) {
@@ -152,11 +163,11 @@ static int read_cmdline(pid_t pid, char **out, const char *comm, command_name_t 
             cap *= 2;
             char *t = realloc(cmdline, cap);
             if (!t) {
-                free(cmdline);
                 fclose(f);
                 return -1;
             }
-            cmdline = t;
+            cmdline = buffer->data = t;
+            buffer->cap = cap;
         }
     }
     int readable = !ferror(f);
@@ -198,24 +209,20 @@ static int read_cmdline(pid_t pid, char **out, const char *comm, command_name_t 
     cmdline[n] = '\0';
     if (readable) {
         *out = cmdline;
-    } else {
-        free(cmdline);
     }
     return 0;
 }
 
 /* Return 1 for a match, 0 for unreadable/empty command lines, -1 on allocation failure. */
-static int matches_filter(pid_t pid, const regex_t *filter) {
+static int matches_filter(pid_t pid, const regex_t *filter, command_buffer_t *buffer) {
     if (pid == getpid()) {
         return 0;
     }
     char *cmdline;
-    if (read_cmdline(pid, &cmdline, NULL, NULL) != 0) {
+    if (read_cmdline(pid, buffer, &cmdline, NULL, NULL) != 0) {
         return -1;
     }
-    int matched = cmdline && *cmdline && regexec(filter, cmdline, 0, NULL, 0) == 0;
-    free(cmdline);
-    return matched;
+    return cmdline && *cmdline && regexec(filter, cmdline, 0, NULL, 0) == 0;
 }
 
 /* Scan /proc and collect (pid, ppid) for every process. */
@@ -232,6 +239,7 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
         return -1;
     }
 
+    command_buffer_t command = {0};
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         if (!is_all_digits(e->d_name)) {
@@ -248,6 +256,7 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
             cap *= 2;
             proc_t *t = realloc(arr, cap * sizeof(*arr));
             if (!t) {
+                free(command.data);
                 free(arr);
                 closedir(d);
                 return -1;
@@ -255,14 +264,16 @@ static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t 
             arr = t;
         }
         arr[n] = proc;
-        arr[n].selected = filter ? matches_filter(pid, filter) : pid == root;
+        arr[n].selected = filter ? matches_filter(pid, filter, &command) : pid == root;
         if (arr[n].selected < 0) {
+            free(command.data);
             free(arr);
             closedir(d);
             return -1;
         }
         n++;
     }
+    free(command.data);
     closedir(d);
 
     *out = arr;
@@ -429,11 +440,13 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
     fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
             pid_width, "PID", cpu_width, "%CPU", mem_width, "%MEM", "COMMAND", reset);
     size_t depth = 0;
+    command_buffer_t buffer = {0};
     for (size_t cur = root; cur != SIZE_MAX;) {
         proc_t *proc = &procs[cur];
         char *command;
-        command_name_t name;
-        if (read_cmdline(proc->pid, &command, proc->comm, &name) != 0) {
+        command_name_t name = {0};
+        if (read_cmdline(proc->pid, &buffer, &command, proc->comm, color ? &name : NULL) != 0) {
+            free(buffer.data);
             free(ancestors);
             return -1;
         }
@@ -461,7 +474,6 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             fputc(']', out);
         }
         fputc('\n', out);
-        free(command);
 
         if (proc->child != SIZE_MAX) {
             ancestors[depth++] = cur;
@@ -473,6 +485,7 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             cur = procs[cur].sibling;
         }
     }
+    free(buffer.data);
     free(ancestors);
     return 0;
 }

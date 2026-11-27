@@ -36,13 +36,14 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &start);
     int result = 0;
     if (commands) {
+        command_buffer_t buffer = {0};
         for (size_t i = 0; i < n && result == 0; i++) {
             char *command;
             command_name_t name;
-            result = read_cmdline(self.pid, &command, self.comm,
+            result = read_cmdline(self.pid, &buffer, &command, self.comm,
                                   strcmp(mode, "commands-color") == 0 ? &name : NULL);
-            free(command);
         }
+        free(buffer.data);
     } else if (display) {
         for (size_t i = 0; i < n; i++) {
             redraw("\033[1mPID %CPU %MEM COMMAND\033[0m\n"
