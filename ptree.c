@@ -686,7 +686,7 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
 }
 
 /* Bound each frame to the current terminal size so refreshes never scroll. */
-static void redraw(const char *frame, int color) {
+static void redraw(const char *frame, int color, locale_t display_locale) {
     struct winsize size = {0};
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &size);
     int rows = size.ws_row ? size.ws_row : 24;
@@ -694,7 +694,6 @@ static void redraw(const char *frame, int color) {
     int row = 0, col = 0;
     mbstate_t state = {0};
     /* Apply the user's character encoding to display without changing regexes. */
-    locale_t display_locale = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
     locale_t previous_locale = uselocale(display_locale);
 
     printf("\033[H\033[J");
@@ -753,11 +752,11 @@ static void redraw(const char *frame, int color) {
     }
     if (display_locale) {
         uselocale(previous_locale);
-        freelocale(display_locale);
     }
 }
 
-static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous) {
+static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous,
+                   locale_t display_locale) {
     if (!terminal) {
         return print_snapshot(inputs, stdout, previous);
     }
@@ -775,7 +774,7 @@ static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous)
         result = 1;
     }
     if (result == 0) {
-        redraw(frame, inputs->color);
+        redraw(frame, inputs->color, display_locale);
     }
     free(frame);
     return result;
@@ -802,11 +801,15 @@ int main(int argc, char **argv) {
     const char *term = getenv("TERM");
     inputs.color = inputs.tree && terminal && !(no_color && *no_color)
                    && !(term && strcmp(term, "dumb") == 0);
+    locale_t display_locale = (locale_t)0;
+    if (inputs.watch && terminal) {
+        display_locale = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
+    }
     snapshot_t previous = {0};
     int result;
     do {
         result = refresh(&inputs, inputs.watch && terminal,
-                         inputs.watch && inputs.tree ? &previous : NULL);
+                         inputs.watch && inputs.tree ? &previous : NULL, display_locale);
         if (fflush(stdout) != 0) {
             perror("stdout");
             result = 1;
@@ -826,6 +829,9 @@ int main(int argc, char **argv) {
     } while (result == 0);
 
     free(previous.procs);
+    if (display_locale) {
+        freelocale(display_locale);
+    }
     if (inputs.use_filter) {
         regfree(&inputs.filter);
     }

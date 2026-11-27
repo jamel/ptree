@@ -45,10 +45,12 @@ int main(int argc, char **argv) {
         }
         free(buffer.data);
     } else if (display) {
+        locale_t display_locale = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
         for (size_t i = 0; i < n; i++) {
             redraw("\033[1mPID %CPU %MEM COMMAND\033[0m\n"
-                   "123 0.0 0.0 /path/é界é --argument\n", 1);
+                   "123 0.0 0.0 /path/é界é --argument\n", 1, display_locale);
         }
+        if (display_locale) freelocale(display_locale);
     } else if (strcmp(mode, "list") == 0 || strcmp(mode, "tree") == 0 ||
                strcmp(mode, "watch") == 0) {
         result = print_trees(sink, &current, 0, strcmp(mode, "list") != 0, 0,

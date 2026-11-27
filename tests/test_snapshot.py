@@ -109,6 +109,19 @@ static long fixture_sysconf(int name) {
 
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
+    if (strcmp(argv[1], "locale") == 0) {
+        locale_t caller = newlocale(LC_CTYPE_MASK, "C", (locale_t)0);
+        locale_t display = newlocale(LC_CTYPE_MASK, "C.UTF-8", (locale_t)0);
+        if (!caller || !display) return 2;
+        locale_t original = uselocale(caller);
+        redraw("é界é", 0, display);
+        int restored = uselocale((locale_t)0) == caller;
+        uselocale(original);
+        freelocale(display);
+        freelocale(caller);
+        if (!restored) fputs("redraw did not restore the caller locale\n", stderr);
+        return restored ? 0 : 1;
+    }
     proc_t procs[] = {
         {.pid = 60, .ppid = 20},
         {.pid = 90, .ppid = 900, .selected = 1},
@@ -198,8 +211,8 @@ class SnapshotTests(unittest.TestCase):
                         "-o", str(cls.binary)], check=True, capture_output=True)
 
     def run_snapshot(self, mode):
-        result = subprocess.run([str(self.binary), mode], capture_output=True,
-                                check=True, timeout=3)
+        result = subprocess.run([str(self.binary), mode], capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stderr, b"")
         return result.stdout.decode()
 
@@ -257,3 +270,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("\x1b[97mshort\x1b[0m", colored)
         self.assertIn("[\x1b[97mprocess\x1b[0m]", colored)
         self.assertEqual(re.sub(r"\x1b\[[0-9;]*m", "", colored), self.run_snapshot("commands"))
+
+    def test_redraw_restores_the_callers_thread_locale(self):
+        """Render Unicode and restore a non-global caller locale"""
+        self.assertEqual(self.run_snapshot("locale"), "\x1b[H\x1b[Jé界é")

@@ -396,6 +396,18 @@ int main(int argc, char **argv) {
                 frame = self.plain(watch.frame().decode("utf-8"))
                 self.assertTrue(frame.endswith(suffix), frame)
 
+    def test_watch_display_locale_does_not_change_filter_matching(self):
+        """Keep C-locale regex matching with a Unicode display environment"""
+        token = "ptree-locale-" + uuid.uuid4().hex
+        proc = subprocess.Popen(["é" + token, "60"], executable="/usr/bin/sleep")
+        self.addCleanup(proc.wait, timeout=2)
+        self.addCleanup(proc.terminate)
+        watch = Watch(self, ["--watch=0.05", "-f", f"^[[:alpha:]]{re.escape(token)} 60$"],
+                      terminal=True, env={**self.env, "LC_ALL": "C.UTF-8"})
+        # C.UTF-8 considers é alphabetic; the CLI's C-locale regex does not.
+        self.assertEqual(watch.frame(), b"")
+        self.assertEqual(watch.frame(), b"")
+
     def test_empty_selection_and_removed_tree_options(self):
         """Report no matches and reject removed tree options"""
         for args, status in ((["-f", "^ptree-tree-missing$"], 1),
