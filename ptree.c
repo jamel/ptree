@@ -383,25 +383,19 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
         return -1;
     }
 
-    qsort(procs, n, sizeof(*procs), compare_pid);
-    for (size_t i = 0; i < n; i++) {
-        procs[i].child = procs[i].sibling = SIZE_MAX;
-    }
-    /* Prepend in reverse PID order so roots and siblings print in PID order.
-     * A matching descendant stays under its selected parent, even if it also
-     * matched the filter itself. */
+    /* Children are already linked in PID order. Only selected processes whose
+     * parent is absent or unselected become roots of the displayed forest. */
     size_t root = SIZE_MAX;
     for (size_t i = n; i-- > 0;) {
         if (!procs[i].selected) {
             continue;
         }
-        size_t *head = &root;
         size_t parent = find_proc(procs, n, procs[i].ppid);
         if (parent != SIZE_MAX && parent != i && procs[parent].selected) {
-            head = &procs[parent].child;
+            continue;
         }
-        procs[i].sibling = *head;
-        *head = i;
+        procs[i].sibling = root;
+        root = i;
     }
 
     const char *reset = color ? "\033[0m" : "";
@@ -473,40 +467,57 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
 }
 
 /*
- * BFS from all selected roots, selecting each PID once. Each iteration scans the
- * proc table for children of the current frontier. O(n^2) worst case,
- * which is trivial for realistic process counts (a few thousand).
+ * Link children once, then BFS from all selected roots, selecting each PID once.
+ * Lists retain discovery order; tree children are linked in PID order.
  */
 static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int color,
                        const snapshot_t *previous) {
     proc_t *procs = current->procs;
     size_t n = current->n;
-    pid_t *queue = malloc(n * sizeof(*queue));
+    size_t *queue = malloc(n * sizeof(*queue));
     if (!queue) {
         return -1;
     }
 
-    size_t head = 0, tail = 0;
-
+    /* Save discovery PIDs before sorting. After linking children, compact the
+     * selected roots into this storage as indices for the BFS queue. */
     for (size_t i = 0; i < n; i++) {
-        if (procs[i].selected) {
-            queue[tail++] = procs[i].pid;
+        queue[i] = procs[i].pid;
+    }
+    qsort(procs, n, sizeof(*procs), compare_pid);
+    for (size_t i = 0; i < n; i++) {
+        procs[i].child = procs[i].sibling = SIZE_MAX;
+    }
+    for (size_t i = n; i-- > 0;) {
+        size_t child = tree ? i : find_proc(procs, n, (pid_t)queue[i]);
+        size_t parent = find_proc(procs, n, procs[child].ppid);
+        if (parent != SIZE_MAX && parent != child) {
+            procs[child].sibling = procs[parent].child;
+            procs[parent].child = child;
         }
     }
 
+    size_t head = 0, tail = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t index = find_proc(procs, n, (pid_t)queue[i]);
+        if (procs[index].selected) {
+            queue[tail++] = index;
+        }
+    }
     while (head < tail) {
-        pid_t cur = queue[head++];
-        for (size_t i = 0; i < n; i++) {
-            if (!procs[i].selected && procs[i].ppid == cur) {
-                procs[i].selected = 1;
-                queue[tail++] = procs[i].pid;
+        size_t cur = queue[head++];
+        for (size_t child = procs[cur].child; child != SIZE_MAX;
+             child = procs[child].sibling) {
+            if (!procs[child].selected) {
+                procs[child].selected = 1;
+                queue[tail++] = child;
             }
         }
     }
     if (!tree) {
         int printed = 0;
         for (size_t i = 0; i < tail; i++) {
-            print_pid(out, queue[i], comma, &printed);
+            print_pid(out, procs[queue[i]].pid, comma, &printed);
         }
         if (comma) {
             fprintf(out, "\n");
@@ -638,7 +649,7 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
         }
     }
     if (previous) {
-        /* Rendering sorts nonempty tree frames; retain sorted empty ones too. */
+        /* Traversal sorts nonempty frames; retain sorted empty ones too. */
         if (!found) {
             qsort(current.procs, current.n, sizeof(*current.procs), compare_pid);
         }
