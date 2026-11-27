@@ -181,54 +181,59 @@ static int is_all_digits(const char *s) {
     return 1;
 }
 
-/* Read a command line into buff with its arguments joined by spaces. Returns
- * whether it could be read. */
-static int read_cmdline(pid_t pid, buff_t *buff, const char *comm, command_name_t *name) {
-    if (name) {
-        *name = (command_name_t){0};
+/*
+ * Pick the part of a NUL-separated command line to highlight: the argument
+ * whose basename is comm, or else argv[0]'s basename when a process has
+ * renamed itself or supplied a different argv[0]. Linux may truncate comm to
+ * 15 bytes.
+ */
+static command_name_t find_command_name(const char *cmdline, size_t n, const char *comm) {
+    command_name_t name = {0};
+    size_t comm_len = strlen(comm);
+    for (size_t arg = 0; arg < n;) {
+        size_t end = arg + strnlen(cmdline + arg, n - arg);
+        size_t base = arg;
+        for (size_t i = arg; i < end; i++) {
+            if (cmdline[i] == '/') {
+                base = i + 1;
+            }
+        }
+        int matched = comm_len > 0 && end - base >= comm_len
+                      && (end - base == comm_len || comm_len == 15)
+                      && memcmp(cmdline + base, comm, comm_len) == 0;
+        if (matched) {
+            return (command_name_t){.start = base, .end = end};
+        }
+        if (arg == 0) {
+            name = (command_name_t){.start = base, .end = end};
+        }
+        arg = end + 1;
     }
+    return name;
+}
+
+/* Read a command line into buff with its arguments joined by spaces, leaving
+ * its length in buff->len. Returns whether it could be read. */
+static int read_cmdline(pid_t pid, buff_t *buff, const char *comm, command_name_t *name) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
     if (!buff_read_file(buff, path)) {
         return 0;
     }
     char *cmdline = buff->data;
-    size_t n = buff->len;
-
-    if (n > 0 && cmdline[n - 1] == '\0') {
-        n--;
+    if (buff->len > 0 && cmdline[buff->len - 1] == '\0') {
+        buff->len--;
     }
     if (name) {
-        /* Match comm before joining arguments, so spaces in paths are safe.
-         * Linux may truncate comm to 15 bytes. Fall back to argv[0]'s basename
-         * when a process has renamed itself or supplied a different argv[0]. */
-        size_t comm_len = strlen(comm);
-        for (size_t arg = 0; arg < n;) {
-            size_t end = arg + strnlen(cmdline + arg, n - arg);
-            size_t base = arg;
-            for (size_t i = arg; i < end; i++) {
-                if (cmdline[i] == '/') {
-                    base = i + 1;
-                }
-            }
-            int matched = comm_len > 0 && end - base >= comm_len
-                          && (end - base == comm_len || comm_len == 15)
-                          && memcmp(cmdline + base, comm, comm_len) == 0;
-            if (arg == 0 || matched) {
-                *name = (command_name_t){.start = base, .end = end};
-            }
-            if (matched) {
-                break;
-            }
-            arg = end + 1;
-        }
+        /* NULs still separate the arguments here, so spaces in paths are safe. */
+        *name = find_command_name(cmdline, buff->len, comm);
     }
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < buff->len; i++) {
         if (cmdline[i] == '\0') {
             cmdline[i] = ' ';
         }
     }
-    cmdline[n] = '\0';
+    cmdline[buff->len] = '\0';
     return 1;
 }
 
@@ -326,27 +331,35 @@ static size_t find_proc(const proc_t *procs, size_t n, pid_t pid) {
     return SIZE_MAX;
 }
 
-/* Keep commands on one display line, including in terminal watch mode. */
-static void print_command(FILE *out, const char *command, command_name_t name,
+/* Keep text on one display line, including in terminal watch mode: control
+ * characters become '?'. */
+static void print_text(FILE *out, const char *text, size_t n) {
+    size_t start = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (iscntrl((unsigned char)text[i])) {
+            fwrite(text + start, 1, i - start, out);
+            fputc('?', out);
+            start = i + 1;
+        }
+    }
+    fwrite(text + start, 1, n - start, out);
+}
+
+/* Print a command, dimming what precedes its name and brightening the name. */
+static void print_command(FILE *out, const char *command, size_t n, command_name_t name,
                           int color) {
-    const char *start = command + name.start;
-    const char *end = command + name.end;
-    if (color && start != command) {
+    if (!color) {
+        print_text(out, command, n);
+        return;
+    }
+    if (name.start) {
         fputs("\033[90m", out);
+        print_text(out, command, name.start);
     }
-    for (; *command; command++) {
-        if (color && command == start) {
-            fputs("\033[97m", out);
-        }
-        if (color && command == end) {
-            fputs("\033[0m", out);
-        }
-        unsigned char c = (unsigned char)*command;
-        fputc(iscntrl(c) ? '?' : c, out);
-    }
-    if (color && command == end) {
-        fputs("\033[0m", out);
-    }
+    fputs("\033[97m", out);
+    print_text(out, command + name.start, name.end - name.start);
+    fputs("\033[0m", out);
+    print_text(out, command + name.end, n - name.end);
 }
 
 static const char *usage_color(double value, double yellow, double red) {
@@ -441,11 +454,12 @@ static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *
             fputs(" \\_ ", out);
             fputs(reset, out);
         }
-        if (readable && *buff->data) {
-            print_command(out, buff->data, name, color);
+        if (readable && buff->len) {
+            print_command(out, buff->data, buff->len, name, color);
         } else {
+            size_t length = strlen(proc->comm);
             fputc('[', out);
-            print_command(out, proc->comm, (command_name_t){.end = strlen(proc->comm)}, color);
+            print_command(out, proc->comm, length, (command_name_t){.end = length}, color);
             fputc(']', out);
         }
         fputc('\n', out);
