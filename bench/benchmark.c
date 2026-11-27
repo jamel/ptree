@@ -74,7 +74,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(mode, "list") == 0 || strcmp(mode, "tree") == 0 ||
                strcmp(mode, "watch") == 0) {
         sort_procs(procs, n);
-        result = print_trees(sink, &current, 0, strcmp(mode, "list") != 0, 0,
+        cli_opts_t inputs = {.format = strcmp(mode, "list") == 0 ? FORMAT_LINES : FORMAT_TREE};
+        result = print_trees(sink, &inputs, &current,
                              strcmp(mode, "watch") == 0 ? &previous : NULL, &buff);
     } else {
         result = 2;

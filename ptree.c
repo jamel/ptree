@@ -58,10 +58,15 @@ typedef struct {
     size_t len, cap;
 } buff_t;
 
+typedef enum {
+    FORMAT_TREE,
+    FORMAT_LINES,
+    FORMAT_COMMA
+} format_t;
+
 typedef struct {
     pid_t root;
-    int comma;
-    int tree;
+    format_t format;
     int color;
     int use_filter;
     regex_t filter;
@@ -302,19 +307,6 @@ static int collect_procs(snapshot_t *out, pid_t root, const regex_t *filter, buf
 
 /* --- Selection and output ----------------------------------------------- */
 
-static void print_pid(FILE *out, pid_t pid, int comma, int *printed) {
-    if (comma) {
-        if (*printed) {
-            fprintf(out, ",");
-        }
-        fprintf(out, "%d", (int)pid);
-        *printed = 1;
-        return;
-    }
-
-    fprintf(out, "%d\n", (int)pid);
-}
-
 /* Look up a PID in a sorted process table. */
 static size_t find_proc(const proc_t *procs, size_t n, pid_t pid) {
     size_t low = 0, high = n;
@@ -394,9 +386,11 @@ static double cpu_usage(const proc_t *proc, const snapshot_t *previous,
 }
 
 /* Render the tree under each root. print_trees has linked every child list. */
-static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *previous,
-                        const size_t *roots, size_t nroots, int color, buff_t *buff) {
+static int print_forest(FILE *out, const cli_opts_t *inputs, const snapshot_t *current,
+                        const snapshot_t *previous, const size_t *roots, size_t nroots,
+                        buff_t *buff) {
     const proc_t *procs = current->procs;
+    int color = inputs->color;
     double uptime;
     if (!buff_read_file(buff, "/proc/uptime")) {
         return -1;
@@ -488,10 +482,11 @@ static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *
  * descendant once. Lists keep scan order; tree siblings are in PID order.
  * The table must be sorted by sort_procs, as collect_procs returns it.
  */
-static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int color,
+static int print_trees(FILE *out, const cli_opts_t *inputs, snapshot_t *current,
                        const snapshot_t *previous, buff_t *buff) {
     proc_t *procs = current->procs;
     size_t n = current->n;
+    int tree = inputs->format == FORMAT_TREE;
     size_t *queue = xrealloc(NULL, n * sizeof(*queue));
 
     /* Queue every process in output order, then link back to front so that
@@ -544,14 +539,12 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
                 queue[nroots++] = queue[i];
             }
         }
-        result = print_forest(out, current, previous, queue, nroots, color, buff);
+        result = print_forest(out, inputs, current, previous, queue, nroots, buff);
     } else {
-        int printed = 0;
+        char separator = inputs->format == FORMAT_COMMA ? ',' : '\n';
         for (size_t i = 0; i < tail; i++) {
-            print_pid(out, procs[queue[i]].pid, comma, &printed);
-        }
-        if (comma) {
-            fprintf(out, "\n");
+            fprintf(out, "%d", (int)procs[queue[i]].pid);
+            fputc(i + 1 < tail ? separator : '\n', out);
         }
     }
     free(queue);
@@ -562,7 +555,7 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
 
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
 static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
-    *inputs = (cli_opts_t){.tree = 1, .interval = {.tv_sec = 5}};
+    *inputs = (cli_opts_t){.interval = {.tv_sec = 5}};
     const char *pid_arg = NULL;
     const char *pattern = NULL;
     const char *interval_arg = NULL;
@@ -578,8 +571,12 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     int opt;
     while ((opt = getopt_long(argc, argv, "clp:f:h", options, NULL)) != -1) {
         switch (opt) {
-        case 'c': inputs->comma = 1; inputs->tree = 0; break;
-        case 'l': inputs->tree = 0; break;
+        case 'c': inputs->format = FORMAT_COMMA; break;
+        case 'l':
+            if (inputs->format == FORMAT_TREE) { /* -c wins in either order */
+                inputs->format = FORMAT_LINES;
+            }
+            break;
         case 'p': pid_arg = optarg; break;
         case 'f': pattern = optarg; break;
         case 'w':
@@ -672,8 +669,7 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
         }
         result = inputs->watch ? 0 : 1;
     } else {
-        result = print_trees(out, &current, inputs->comma, inputs->tree, inputs->color,
-                             previous, buff);
+        result = print_trees(out, inputs, &current, previous, buff);
         if (result != 0) {
             perror("print_trees");
         }
@@ -801,7 +797,7 @@ int main(int argc, char **argv) {
     int terminal = isatty(STDOUT_FILENO);
     const char *no_color = getenv("NO_COLOR");
     const char *term = getenv("TERM");
-    inputs.color = inputs.tree && terminal && !(no_color && *no_color)
+    inputs.color = inputs.format == FORMAT_TREE && terminal && !(no_color && *no_color)
                    && !(term && strcmp(term, "dumb") == 0);
     locale_t display_locale = (locale_t)0;
     if (inputs.watch && terminal) {
@@ -812,8 +808,8 @@ int main(int argc, char **argv) {
     int result;
     do {
         result = refresh(&inputs, inputs.watch && terminal,
-                         inputs.watch && inputs.tree ? &previous : NULL, display_locale,
-                         &buff);
+                         inputs.watch && inputs.format == FORMAT_TREE ? &previous : NULL,
+                         display_locale, &buff);
         if (fflush(stdout) != 0) {
             perror("stdout");
             result = 1;

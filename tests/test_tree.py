@@ -191,7 +191,8 @@ int main(int argc, char **argv) {
     snapshot_t previous = {.procs = &old, .n = 1, .sampled_at = {.tv_sec = 1}};
     snapshot_t current = {.procs = &proc, .n = 1, .sampled_at = {.tv_sec = 101}};
     buff_t buff = {0};
-    int result = print_trees(stdout, &current, 0, 1, 1, &previous, &buff);
+    cli_opts_t inputs = {.format = FORMAT_TREE, .color = 1};
+    int result = print_trees(stdout, &inputs, &current, &previous, &buff);
     free(buff.data);
     return result;
 }

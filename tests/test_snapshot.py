@@ -161,10 +161,12 @@ static int run(int argc, char **argv, buff_t *buff) {
         strcpy(procs[i].comm, "process");
     }
     snapshot_t current = {.procs = procs, .n = n, .sampled_at = {.tv_sec = 10}};
+    cli_opts_t tree = {.format = FORMAT_TREE}, lines = {.format = FORMAT_LINES};
+    cli_opts_t comma = {.format = FORMAT_COMMA};
     if (strcmp(argv[1], "oom") == 0) {
         fixture_scan = 1;
         fixture_oom = 1;
-        cli_opts_t inputs = {.root = 10, .tree = 1};
+        cli_opts_t inputs = {.root = 10};
         return print_snapshot(&inputs, stdout, NULL, buff);
     }
     if (strcmp(argv[1], "duplicates") == 0) {
@@ -174,7 +176,7 @@ static int run(int argc, char **argv, buff_t *buff) {
         };
         snapshot_t scan = {.procs = repeated, .n = 4};
         sort_procs(repeated, scan.n);
-        return print_trees(stdout, &scan, 0, 0, 0, NULL, buff);
+        return print_trees(stdout, &lines, &scan, NULL, buff);
     }
     if (strcmp(argv[1], "siblings") == 0) {
         proc_t family[] = {
@@ -183,14 +185,14 @@ static int run(int argc, char **argv, buff_t *buff) {
         };
         snapshot_t scan = {.procs = family, .n = 5};
         sort_procs(family, scan.n);
-        return print_trees(stdout, &scan, 0, 1, 0, NULL, buff);
+        return print_trees(stdout, &tree, &scan, NULL, buff);
     }
     /* Hand-built tables stand in for a scan, so sort them as collect_procs does. */
     if (strncmp(argv[1], "commands", 8) == 0) {
         fixture_commands = 1;
         if (strcmp(argv[1], "commands-filter") == 0) {
             fixture_scan = 1;
-            cli_opts_t inputs = {.tree = 1, .use_filter = 1};
+            cli_opts_t inputs = {.use_filter = 1};
             if (regcomp(&inputs.filter, "^short$", REG_EXTENDED | REG_NOSUB) != 0) return 2;
             int result = print_snapshot(&inputs, stdout, NULL, buff);
             regfree(&inputs.filter);
@@ -203,9 +205,9 @@ static int run(int argc, char **argv, buff_t *buff) {
             procs[i].selected = 1;
         }
         sort_procs(procs, current.n);
-        int color = strcmp(argv[1], "commands-color") == 0;
-        if (print_trees(stdout, &current, 0, 1, color, NULL, buff) != 0) return 1;
-        return print_trees(stdout, &current, 0, 1, color, NULL, buff);
+        tree.color = strcmp(argv[1], "commands-color") == 0;
+        if (print_trees(stdout, &tree, &current, NULL, buff) != 0) return 1;
+        return print_trees(stdout, &tree, &current, NULL, buff);
     }
     if (strncmp(argv[1], "cpu", 3) == 0) {
         current.n = 6;
@@ -227,22 +229,23 @@ static int run(int argc, char **argv, buff_t *buff) {
         if (strcmp(argv[1], "cpu-after-empty-frame") == 0) {
             fixture_scan = 1;
             snapshot_t empty = {0};
-            cli_opts_t inputs = {.root = 999, .tree = 1, .watch = 1};
+            cli_opts_t inputs = {.root = 999, .watch = 1};
             if (print_snapshot(&inputs, stdout, &empty, buff) != 0) return 1;
             empty.sampled_at.tv_sec = 9;
             empty.sampled_at.tv_nsec = 0;
-            int result = print_trees(stdout, &current, 0, 1, 0, &empty, buff);
+            int result = print_trees(stdout, &tree, &current, &empty, buff);
             free(empty.procs);
             return result;
         }
         if (strcmp(argv[1], "cpu-zero-interval") == 0) previous.sampled_at = current.sampled_at;
         if (strcmp(argv[1], "cpu-empty") == 0) previous.n = 0;
-        return print_trees(stdout, &current, 0, 1, 0,
+        return print_trees(stdout, &tree, &current,
                            strcmp(argv[1], "cpu-first") == 0 ? NULL : &previous, buff);
     }
     sort_procs(procs, n);
-    return print_trees(stdout, &current, strcmp(argv[1], "comma") == 0,
-                       strcmp(argv[1], "tree") == 0, 0, NULL, buff);
+    const cli_opts_t *inputs = strcmp(argv[1], "comma") == 0 ? &comma
+                               : strcmp(argv[1], "tree") == 0 ? &tree : &lines;
+    return print_trees(stdout, inputs, &current, NULL, buff);
 }
 
 int main(int argc, char **argv) {
