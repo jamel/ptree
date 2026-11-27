@@ -289,6 +289,22 @@ static int compare_pid(const void *a, const void *b) {
     return (left > right) - (left < right);
 }
 
+/* Look up a PID in a sorted process table. */
+static size_t find_proc(const proc_t *procs, size_t n, pid_t pid) {
+    size_t low = 0, high = n;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (procs[mid].pid < pid) {
+            low = mid + 1;
+        } else if (procs[mid].pid > pid) {
+            high = mid;
+        } else {
+            return mid;
+        }
+    }
+    return SIZE_MAX;
+}
+
 /* Keep commands on one display line, including in terminal watch mode. */
 static void print_command(FILE *out, const char *command, command_name_t name,
                           int color) {
@@ -380,11 +396,9 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             continue;
         }
         size_t *head = &root;
-        for (size_t j = 0; j < n; j++) {
-            if (procs[j].selected && procs[j].pid == procs[i].ppid && i != j) {
-                head = &procs[j].child;
-                break;
-            }
+        size_t parent = find_proc(procs, n, procs[i].ppid);
+        if (parent != SIZE_MAX && parent != i && procs[parent].selected) {
+            head = &procs[parent].child;
         }
         procs[i].sibling = *head;
         *head = i;
@@ -407,15 +421,15 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
         double elapsed = uptime - (double)proc->starttime / ticks;
         double cpu = elapsed > 0 ? 100.0 * ((double)proc->utime + proc->stime) / ticks / elapsed : 0;
         if (interval > 0) {
-            for (size_t i = 0; i < previous->n; i++) {
-                const proc_t *old = &previous->procs[i];
+            size_t index = find_proc(previous->procs, previous->n, proc->pid);
+            if (index != SIZE_MAX) {
+                const proc_t *old = &previous->procs[index];
                 /* A reused PID belongs to a different process. */
-                if (old->pid == proc->pid && old->starttime == proc->starttime &&
+                if (old->starttime == proc->starttime &&
                     proc->utime >= old->utime && proc->stime >= old->stime) {
                     double used = (double)(proc->utime - old->utime)
                                   + (double)(proc->stime - old->stime);
                     cpu = 100.0 * used / ticks / interval;
-                    break;
                 }
             }
         }
@@ -624,6 +638,10 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
         }
     }
     if (previous) {
+        /* Rendering sorts nonempty tree frames; retain sorted empty ones too. */
+        if (!found) {
+            qsort(current.procs, current.n, sizeof(*current.procs), compare_pid);
+        }
         free(previous->procs);
         *previous = current;
     } else {

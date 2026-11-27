@@ -12,8 +12,16 @@ SOURCE = r'''
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <unistd.h>
+#include <dirent.h>
+static int fixture_scan;
+static DIR *fixture_opendir(const char *path);
+static struct dirent *fixture_readdir(DIR *dir);
+static int fixture_closedir(DIR *dir);
 static FILE *fixture_fopen(const char *path, const char *mode);
 static long fixture_sysconf(int name);
+#define opendir fixture_opendir
+#define readdir fixture_readdir
+#define closedir fixture_closedir
 #define fopen fixture_fopen
 #define sysconf fixture_sysconf
 #define main ptree_main
@@ -21,12 +29,41 @@ static long fixture_sysconf(int name);
 #undef main
 #undef fopen
 #undef sysconf
+#undef opendir
+#undef readdir
+#undef closedir
+
+static DIR *fixture_opendir(const char *path) {
+    return fixture_scan ? (DIR *)&fixture_scan : opendir(path);
+}
+
+static struct dirent *fixture_readdir(DIR *dir) {
+    static size_t cursor;
+    static const char *pids[] = {"60", "20", "40", "10", "50", "30"};
+    static struct dirent entry;
+    if (!fixture_scan) return readdir(dir);
+    if (cursor == 6) return NULL;
+    strcpy(entry.d_name, pids[cursor++]);
+    return &entry;
+}
+
+static int fixture_closedir(DIR *dir) {
+    return fixture_scan ? 0 : closedir(dir);
+}
 
 static FILE *fixture_fopen(const char *path, const char *mode) {
     static char uptime[] = "1000.00 0.00\n";
     static char limit[] = "4194304\n";
     if (strcmp(path, "/proc/uptime") == 0) return fmemopen(uptime, sizeof(uptime) - 1, mode);
     if (strcmp(path, "/proc/sys/kernel/pid_max") == 0) return fmemopen(limit, sizeof(limit) - 1, mode);
+    if (fixture_scan && strstr(path, "/stat")) {
+        static char stat[256];
+        int pid = atoi(path + 6);
+        int length = snprintf(stat, sizeof(stat),
+            "%d (process) S 0 0 0 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 90000 0 100\n",
+            pid, pid * 10);
+        return fmemopen(stat, (size_t)length, mode);
+    }
     errno = ENOENT;
     return NULL;
 }
@@ -75,6 +112,17 @@ int main(int argc, char **argv) {
             {.pid = 60, .starttime = 90000, .utime = 950},
         };
         snapshot_t previous = {.procs = old, .n = 5, .sampled_at = {.tv_sec = 9}};
+        if (strcmp(argv[1], "cpu-after-empty-frame") == 0) {
+            fixture_scan = 1;
+            snapshot_t empty = {0};
+            cli_opts_t inputs = {.root = 999, .tree = 1, .watch = 1};
+            if (print_snapshot(&inputs, stdout, &empty) != 0) return 1;
+            empty.sampled_at.tv_sec = 9;
+            empty.sampled_at.tv_nsec = 0;
+            int result = print_trees(stdout, &current, 0, 1, 0, &empty);
+            free(empty.procs);
+            return result;
+        }
         if (strcmp(argv[1], "cpu-zero-interval") == 0) previous.sampled_at = current.sampled_at;
         if (strcmp(argv[1], "cpu-empty") == 0) previous.n = 0;
         return print_trees(stdout, &current, 0, 1, 0,
@@ -134,3 +182,7 @@ class SnapshotTests(unittest.TestCase):
         for mode in ("cpu-first", "cpu-empty", "cpu-zero-interval"):
             with self.subTest(mode=mode):
                 self.assertEqual(self.cpu_values(mode), [10, 10, 10, 11, 10, 10])
+
+    def test_cpu_history_after_empty_frame_keeps_all_discovered_processes(self):
+        """Use the prior sample after an empty frame with shuffled discovery"""
+        self.assertEqual(self.cpu_values("cpu-after-empty-frame"), [900, 800, 700, 700, 500, 400])
