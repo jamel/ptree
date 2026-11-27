@@ -13,24 +13,25 @@ SOURCE = r'''
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 static pid_t fixture_getpid(void);
 static int fixture_scan;
 static int fixture_commands;
 static DIR *fixture_opendir(const char *path);
 static struct dirent *fixture_readdir(DIR *dir);
 static int fixture_closedir(DIR *dir);
-static FILE *fixture_fopen(const char *path, const char *mode);
+static int fixture_open(const char *path, int flags);
 static long fixture_sysconf(int name);
 #define getpid fixture_getpid
 #define opendir fixture_opendir
 #define readdir fixture_readdir
 #define closedir fixture_closedir
-#define fopen fixture_fopen
+#define open fixture_open
 #define sysconf fixture_sysconf
 #define main ptree_main
 #include "ptree.c"
 #undef main
-#undef fopen
+#undef open
 #undef sysconf
 #undef opendir
 #undef readdir
@@ -59,43 +60,55 @@ static int fixture_closedir(DIR *dir) {
     return fixture_scan ? 0 : closedir(dir);
 }
 
-static FILE *fixture_fopen(const char *path, const char *mode) {
-    static char uptime[] = "1000.00 0.00\n";
-    static char limit[] = "4194304\n";
-    if (strcmp(path, "/proc/uptime") == 0) return fmemopen(uptime, sizeof(uptime) - 1, mode);
-    if (strcmp(path, "/proc/sys/kernel/pid_max") == 0) return fmemopen(limit, sizeof(limit) - 1, mode);
+/* Serve fixture contents through a pipe so the production read and close apply. */
+static int fixture_file(const char *data, size_t length) {
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    ssize_t written = write(fds[1], data, length);
+    close(fds[1]);
+    if (written == (ssize_t)length) return fds[0];
+    close(fds[0]);
+    return -1;
+}
+
+static int fixture_open(const char *path, int flags) {
+    static const char uptime[] = "1000.00 0.00\n";
+    static const char limit[] = "4194304\n";
+    (void)flags;
+    if (strcmp(path, "/proc/uptime") == 0) return fixture_file(uptime, sizeof(uptime) - 1);
+    if (strcmp(path, "/proc/sys/kernel/pid_max") == 0) return fixture_file(limit, sizeof(limit) - 1);
     if (fixture_commands && strstr(path, "/cmdline")) {
         static char long_command[5006];
-        static char short_command[] = "short";
-        static char empty[] = "";
-        static char control[] = "line\nbreak";
-        static char before[] = "before";
-        static char after[] = "after";
+        static const char short_command[] = "short";
+        static const char empty[] = "";
+        static const char control[] = "line\nbreak";
+        static const char before[] = "before";
+        static const char after[] = "after";
         static int changed;
         int pid = atoi(path + 6);
         switch (pid) {
         case 10:
             memset(long_command, 'x', 5000);
             memcpy(long_command + 5000, "\0tail", 6);
-            return fmemopen(long_command, sizeof(long_command), mode);
-        case 20: return fmemopen(short_command, sizeof(short_command), mode);
-        case 30: return fmemopen(empty, sizeof(empty), mode);
-        case 50: return fmemopen(control, sizeof(control), mode);
+            return fixture_file(long_command, sizeof(long_command));
+        case 20: return fixture_file(short_command, sizeof(short_command));
+        case 30: return fixture_file(empty, sizeof(empty));
+        case 50: return fixture_file(control, sizeof(control));
         case 60:
-            if (changed++) return fmemopen(after, sizeof(after), mode);
-            return fmemopen(before, sizeof(before), mode);
+            if (changed++) return fixture_file(after, sizeof(after));
+            return fixture_file(before, sizeof(before));
         }
     }
     if (fixture_scan && strstr(path, "/stat")) {
-        static char stat[256];
+        char stat[256];
         int pid = atoi(path + 6);
         int length = snprintf(stat, sizeof(stat),
             "%d (process) S 0 0 0 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 90000 0 100\n",
             pid, pid * 10);
-        return fmemopen(stat, (size_t)length, mode);
+        return fixture_file(stat, (size_t)length);
     }
     errno = ENOENT;
-    return NULL;
+    return -1;
 }
 
 static long fixture_sysconf(int name) {
@@ -107,7 +120,7 @@ static long fixture_sysconf(int name) {
     }
 }
 
-int main(int argc, char **argv) {
+static int run(int argc, char **argv, buff_t *buff) {
     if (argc != 2) return 2;
     if (strcmp(argv[1], "locale") == 0) {
         locale_t caller = newlocale(LC_CTYPE_MASK, "C", (locale_t)0);
@@ -139,13 +152,32 @@ int main(int argc, char **argv) {
         strcpy(procs[i].comm, "process");
     }
     snapshot_t current = {.procs = procs, .n = n, .sampled_at = {.tv_sec = 10}};
+    if (strcmp(argv[1], "duplicates") == 0) {
+        proc_t repeated[] = {
+            {.pid = 20, .ppid = 10}, {.pid = 10, .selected = 1},
+            {.pid = 20, .ppid = 10}, {.pid = 30, .ppid = 20},
+        };
+        snapshot_t scan = {.procs = repeated, .n = 4};
+        sort_procs(repeated, scan.n);
+        return print_trees(stdout, &scan, 0, 0, 0, NULL, buff);
+    }
+    if (strcmp(argv[1], "siblings") == 0) {
+        proc_t family[] = {
+            {.pid = 10}, {.pid = 20, .ppid = 10, .selected = 1}, {.pid = 30, .ppid = 10},
+            {.pid = 40, .ppid = 10, .selected = 1}, {.pid = 50, .ppid = 20},
+        };
+        snapshot_t scan = {.procs = family, .n = 5};
+        sort_procs(family, scan.n);
+        return print_trees(stdout, &scan, 0, 1, 0, NULL, buff);
+    }
+    /* Hand-built tables stand in for a scan, so sort them as collect_procs does. */
     if (strncmp(argv[1], "commands", 8) == 0) {
         fixture_commands = 1;
         if (strcmp(argv[1], "commands-filter") == 0) {
             fixture_scan = 1;
             cli_opts_t inputs = {.tree = 1, .use_filter = 1};
             if (regcomp(&inputs.filter, "^short$", REG_EXTENDED | REG_NOSUB) != 0) return 2;
-            int result = print_snapshot(&inputs, stdout, NULL);
+            int result = print_snapshot(&inputs, stdout, NULL, buff);
             regfree(&inputs.filter);
             return result;
         }
@@ -155,9 +187,10 @@ int main(int argc, char **argv) {
             procs[i].ppid = 0;
             procs[i].selected = 1;
         }
+        sort_procs(procs, current.n);
         int color = strcmp(argv[1], "commands-color") == 0;
-        if (print_trees(stdout, &current, 0, 1, color, NULL) != 0) return 1;
-        return print_trees(stdout, &current, 0, 1, color, NULL);
+        if (print_trees(stdout, &current, 0, 1, color, NULL, buff) != 0) return 1;
+        return print_trees(stdout, &current, 0, 1, color, NULL, buff);
     }
     if (strncmp(argv[1], "cpu", 3) == 0) {
         current.n = 6;
@@ -167,6 +200,7 @@ int main(int argc, char **argv) {
             procs[i].selected = 1;
         }
         procs[3].stime = 100;
+        sort_procs(procs, current.n);
         proc_t old[] = {
             {.pid = 10, .starttime = 90000, .utime = 900},
             {.pid = 20, .starttime = 89999, .utime = 900},
@@ -179,20 +213,28 @@ int main(int argc, char **argv) {
             fixture_scan = 1;
             snapshot_t empty = {0};
             cli_opts_t inputs = {.root = 999, .tree = 1, .watch = 1};
-            if (print_snapshot(&inputs, stdout, &empty) != 0) return 1;
+            if (print_snapshot(&inputs, stdout, &empty, buff) != 0) return 1;
             empty.sampled_at.tv_sec = 9;
             empty.sampled_at.tv_nsec = 0;
-            int result = print_trees(stdout, &current, 0, 1, 0, &empty);
+            int result = print_trees(stdout, &current, 0, 1, 0, &empty, buff);
             free(empty.procs);
             return result;
         }
         if (strcmp(argv[1], "cpu-zero-interval") == 0) previous.sampled_at = current.sampled_at;
         if (strcmp(argv[1], "cpu-empty") == 0) previous.n = 0;
         return print_trees(stdout, &current, 0, 1, 0,
-                           strcmp(argv[1], "cpu-first") == 0 ? NULL : &previous);
+                           strcmp(argv[1], "cpu-first") == 0 ? NULL : &previous, buff);
     }
+    sort_procs(procs, n);
     return print_trees(stdout, &current, strcmp(argv[1], "comma") == 0,
-                       strcmp(argv[1], "tree") == 0, 0, NULL);
+                       strcmp(argv[1], "tree") == 0, 0, NULL, buff);
+}
+
+int main(int argc, char **argv) {
+    buff_t buff = {0};
+    int result = run(argc, argv, &buff);
+    free(buff.data);
+    return result;
 }
 '''
 
@@ -232,6 +274,18 @@ class SnapshotTests(unittest.TestCase):
                          "     60  10.0   1.0      \\_ [process]\n"
                          "     70  10.0   1.0 [process]\n"
                          "     90  10.0   1.0 [process]\n")
+
+    def test_repeated_scan_entries_are_listed_without_looping(self):
+        """List a PID the scan reported twice without relinking its children"""
+        self.assertEqual(self.run_snapshot("duplicates"), "10\n20\n20\n30\n")
+
+    def test_roots_exclude_unselected_siblings(self):
+        """Render selected roots without their unselected parent's other children"""
+        self.assertEqual(self.run_snapshot("siblings"),
+                         "    PID  %CPU  %MEM COMMAND\n"
+                         "     20   0.0   0.0 []\n"
+                         "     50   0.0   0.0  \\_ []\n"
+                         "     40   0.0   0.0 []\n")
 
     def cpu_values(self, mode):
         return [float(line.split()[1]) for line in self.run_snapshot(mode).splitlines()[1:]]

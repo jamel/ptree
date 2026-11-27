@@ -190,7 +190,10 @@ int main(int argc, char **argv) {
     proc.rss = (pages * strtol(argv[2], NULL, 10) + 99) / 100;
     snapshot_t previous = {.procs = &old, .n = 1, .sampled_at = {.tv_sec = 1}};
     snapshot_t current = {.procs = &proc, .n = 1, .sampled_at = {.tv_sec = 101}};
-    return print_trees(stdout, &current, 0, 1, 1, &previous);
+    buff_t buff = {0};
+    int result = print_trees(stdout, &current, 0, 1, 1, &previous, &buff);
+    free(buff.data);
+    return result;
 }
 '''
         with tempfile.TemporaryDirectory() as directory:

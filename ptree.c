@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <locale.h>
 #include <math.h>
@@ -34,7 +35,8 @@ typedef struct {
     unsigned long long utime, stime, starttime;
     long rss;
     char comm[256];
-    size_t child, sibling;
+    size_t order;                  /* position in the /proc scan */
+    size_t parent, child, sibling; /* table indices or SIZE_MAX, linked by print_trees */
 } proc_t;
 
 typedef struct {
@@ -47,10 +49,11 @@ typedef struct {
     size_t start, end;
 } command_name_t;
 
+/* Growable storage. The owner frees data and may reuse its capacity. */
 typedef struct {
     char *data;
-    size_t cap;
-} command_buffer_t;
+    size_t len, cap;
+} buff_t;
 
 typedef struct {
     pid_t root;
@@ -69,35 +72,79 @@ typedef enum {
     PARSE_ERROR
 } parse_result_t;
 
+/* Make room for at least size bytes, doubling so repeated growth stays cheap. */
+static int buff_reserve(buff_t *buff, size_t size) {
+    if (size <= buff->cap) {
+        return 0;
+    }
+    size_t cap = buff->cap ? buff->cap : 4096;
+    while (cap < size) {
+        cap *= 2;
+    }
+    char *data = realloc(buff->data, cap);
+    if (!data) {
+        return -1;
+    }
+    buff->data = data;
+    buff->cap = cap;
+    return 0;
+}
+
+/*
+ * Replace the contents with the whole file, NUL-terminated. Returns 1 when
+ * read, 0 when the file is missing or unreadable, -1 on allocation failure;
+ * errno then describes the failure.
+ */
+static int buff_read_file(buff_t *buff, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+    int result;
+    buff->len = 0;
+    for (;;) {
+        if (buff_reserve(buff, buff->len + 2) != 0) { /* one byte and the NUL */
+            result = -1;
+            break;
+        }
+        ssize_t count = read(fd, buff->data + buff->len, buff->cap - buff->len - 1);
+        if (count <= 0) {
+            result = count == 0;
+            break;
+        }
+        buff->len += (size_t)count;
+    }
+    int error = errno;
+    close(fd);
+    errno = error;
+    if (result > 0) {
+        buff->data[buff->len] = '\0';
+    }
+    return result;
+}
+
 /*
  * Read the parent, CPU times, resident pages, and name from /proc/<pid>/stat.
+ * Returns 1 when parsed, 0 when the process is gone, -1 on allocation failure.
  *
  * The "stat" file has the form:
  *   <pid> (<comm>) <state> <ppid> ...
  * where <comm> may itself contain spaces and parentheses. To parse safely
  * we locate the LAST ')' and read fields after it.
  */
-static int read_stat(pid_t pid, proc_t *proc) {
+static int read_stat(pid_t pid, proc_t *proc, buff_t *buff) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        return -1;
+    int readable = buff_read_file(buff, path);
+    if (readable <= 0) {
+        return readable;
     }
 
-    char buf[4096];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    if (n == 0) {
-        return -1;
-    }
-    buf[n] = '\0';
-
-    char *lparen = strchr(buf, '(');
-    char *rparen = strrchr(buf, ')');
+    char *lparen = strchr(buff->data, '(');
+    char *rparen = strrchr(buff->data, ')');
     if (!lparen || !rparen || rparen <= lparen) {
-        return -1;
+        return 0;
     }
 
     char state;
@@ -109,13 +156,13 @@ static int read_stat(pid_t pid, proc_t *proc) {
                " %llu %*s %ld",                        /* starttime, vsize, rss */
                &state, &ppid, &proc->utime, &proc->stime,
                &proc->starttime, &proc->rss) != 6) {
-        return -1;
+        return 0;
     }
 
     proc->pid = pid;
     proc->ppid = (pid_t)ppid;
     snprintf(proc->comm, sizeof(proc->comm), "%.*s", (int)(rparen - lparen - 1), lparen + 1);
-    return 0;
+    return 1;
 }
 
 static int is_all_digits(const char *s) {
@@ -130,48 +177,20 @@ static int is_all_digits(const char *s) {
     return 1;
 }
 
-/* *out borrows buffer storage until the next read; unreadable lines leave it
- * NULL. The caller owns buffer->data and may reuse its capacity across reads. */
-static int read_cmdline(pid_t pid, command_buffer_t *buffer, char **out,
-                        const char *comm, command_name_t *name) {
-    *out = NULL;
+/* Read a command line into buff with its arguments joined by spaces. Returns 1
+ * when read, 0 when unreadable, -1 on allocation failure. */
+static int read_cmdline(pid_t pid, buff_t *buff, const char *comm, command_name_t *name) {
     if (name) {
         *name = (command_name_t){0};
     }
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        return 0;
+    int readable = buff_read_file(buff, path);
+    if (readable <= 0) {
+        return readable;
     }
-
-    if (!buffer->data) {
-        buffer->data = malloc(4096);
-        if (!buffer->data) {
-            fclose(f);
-            return -1;
-        }
-        buffer->cap = 4096;
-    }
-    size_t cap = buffer->cap, n = 0;
-    char *cmdline = buffer->data;
-
-    size_t count;
-    while ((count = fread(cmdline + n, 1, cap - n - 1, f)) > 0) {
-        n += count;
-        if (n == cap - 1) {
-            cap *= 2;
-            char *t = realloc(cmdline, cap);
-            if (!t) {
-                fclose(f);
-                return -1;
-            }
-            cmdline = buffer->data = t;
-            buffer->cap = cap;
-        }
-    }
-    int readable = !ferror(f);
-    fclose(f);
+    char *cmdline = buff->data;
+    size_t n = buff->len;
 
     if (n > 0 && cmdline[n - 1] == '\0') {
         n--;
@@ -207,76 +226,78 @@ static int read_cmdline(pid_t pid, command_buffer_t *buffer, char **out,
         }
     }
     cmdline[n] = '\0';
-    if (readable) {
-        *out = cmdline;
-    }
-    return 0;
+    return 1;
 }
 
 /* Return 1 for a match, 0 for unreadable/empty command lines, -1 on allocation failure. */
-static int matches_filter(pid_t pid, const regex_t *filter, command_buffer_t *buffer) {
-    if (pid == getpid()) {
-        return 0;
+static int matches_filter(pid_t pid, const regex_t *filter, buff_t *buff) {
+    int readable = read_cmdline(pid, buff, NULL, NULL);
+    if (readable <= 0) {
+        return readable;
     }
-    char *cmdline;
-    if (read_cmdline(pid, buffer, &cmdline, NULL, NULL) != 0) {
-        return -1;
-    }
-    return cmdline && *cmdline && regexec(filter, cmdline, 0, NULL, 0) == 0;
+    return *buff->data && regexec(filter, buff->data, 0, NULL, 0) == 0;
 }
 
-/* Scan /proc and collect (pid, ppid) for every process. */
-static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t *filter) {
+static int compare_pid(const void *a, const void *b) {
+    pid_t left = ((const proc_t *)a)->pid;
+    pid_t right = ((const proc_t *)b)->pid;
+    return (left > right) - (left < right);
+}
+
+/* Sort a scanned table by PID for lookups, remembering each scan position. */
+static void sort_procs(proc_t *procs, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        procs[i].order = i;
+    }
+    if (n > 1) {
+        qsort(procs, n, sizeof(*procs), compare_pid);
+    }
+}
+
+/* Scan /proc into a table sorted by PID, selecting the root or filter matches. */
+static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t *filter,
+                         buff_t *buff) {
     DIR *d = opendir("/proc");
     if (!d) {
         return -1;
     }
 
-    size_t cap = 256, n = 0;
-    proc_t *arr = malloc(cap * sizeof(*arr));
-    if (!arr) {
-        closedir(d);
-        return -1;
-    }
-
-    command_buffer_t command = {0};
+    buff_t table = {0};
+    size_t n = 0;
+    pid_t self = getpid();
+    int status = 0;
     struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
+    while (status >= 0 && (e = readdir(d)) != NULL) {
         if (!is_all_digits(e->d_name)) {
             continue;
         }
 
         pid_t pid = (pid_t)atoi(e->d_name);
-        proc_t proc = {0};
-        if (read_stat(pid, &proc) != 0) {
-            continue; /* process gone, skip */
+        status = buff_reserve(&table, (n + 1) * sizeof(proc_t));
+        if (status < 0) {
+            break;
         }
-
-        if (n == cap) {
-            cap *= 2;
-            proc_t *t = realloc(arr, cap * sizeof(*arr));
-            if (!t) {
-                free(command.data);
-                free(arr);
-                closedir(d);
-                return -1;
-            }
-            arr = t;
+        proc_t *proc = (proc_t *)table.data + n;
+        *proc = (proc_t){0};
+        status = read_stat(pid, proc, buff);
+        if (status <= 0) {
+            continue; /* process gone: skip it; an allocation failure ends the scan */
         }
-        arr[n] = proc;
-        arr[n].selected = filter ? matches_filter(pid, filter, &command) : pid == root;
-        if (arr[n].selected < 0) {
-            free(command.data);
-            free(arr);
-            closedir(d);
-            return -1;
+        if (!filter) {
+            proc->selected = pid == root;
+        } else if (pid != self) { /* ptree's own arguments contain the pattern */
+            status = proc->selected = matches_filter(pid, filter, buff);
         }
         n++;
     }
-    free(command.data);
     closedir(d);
+    if (status < 0) {
+        free(table.data);
+        return -1;
+    }
 
-    *out = arr;
+    sort_procs((proc_t *)table.data, n);
+    *out = (proc_t *)table.data;
     *out_n = n;
     return 0;
 }
@@ -292,12 +313,6 @@ static void print_pid(FILE *out, pid_t pid, int comma, int *printed) {
     }
 
     fprintf(out, "%d\n", (int)pid);
-}
-
-static int compare_pid(const void *a, const void *b) {
-    pid_t left = ((const proc_t *)a)->pid;
-    pid_t right = ((const proc_t *)b)->pid;
-    return (left > right) - (left < right);
 }
 
 /* Look up a PID in a sorted process table. */
@@ -349,24 +364,6 @@ static const char *usage_color(double value, double yellow, double red) {
     return "\033[32m";
 }
 
-static size_t forest_roots(proc_t *procs, size_t n) {
-    /* Children are already linked in PID order. Only selected processes whose
-     * parent is absent or unselected become roots of the displayed forest. */
-    size_t root = SIZE_MAX;
-    for (size_t i = n; i-- > 0;) {
-        if (!procs[i].selected) {
-            continue;
-        }
-        size_t parent = find_proc(procs, n, procs[i].ppid);
-        if (parent != SIZE_MAX && parent != i && procs[parent].selected) {
-            continue;
-        }
-        procs[i].sibling = root;
-        root = i;
-    }
-    return root;
-}
-
 static double cpu_usage(const proc_t *proc, const snapshot_t *previous,
                         long ticks, double uptime, double interval) {
     /* Watch frames use the CPU time consumed since the last scan. */
@@ -388,34 +385,28 @@ static double cpu_usage(const proc_t *proc, const snapshot_t *previous,
     return elapsed > 0 ? 100.0 * ((double)proc->utime + proc->stime) / ticks / elapsed : 0;
 }
 
-/* The current table is sorted by PID and its children are already linked. */
-static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previous,
-                        int color) {
-    proc_t *procs = current->procs;
-    size_t n = current->n;
+/* Render the tree under each root. print_trees has linked every child list. */
+static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *previous,
+                        const size_t *roots, size_t nroots, int color, buff_t *buff) {
+    const proc_t *procs = current->procs;
     double uptime;
-    FILE *f = fopen("/proc/uptime", "r");
-    if (!f) {
+    if (buff_read_file(buff, "/proc/uptime") <= 0) {
         return -1;
     }
-    int read = fscanf(f, "%lf", &uptime);
-    fclose(f);
+    int parsed = sscanf(buff->data, "%lf", &uptime);
     long ticks = sysconf(_SC_CLK_TCK);
     long pages = sysconf(_SC_PHYS_PAGES);
     long ncores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (read != 1 || ticks <= 0 || pages <= 0 || ncores <= 0) {
+    if (parsed != 1 || ticks <= 0 || pages <= 0 || ncores <= 0) {
         errno = EIO;
         return -1;
     }
 
     /* pid_max is the allocation wrap value; use the PID type's limit if hidden. */
-    int pid_max = INT32_MAX;
-    f = fopen("/proc/sys/kernel/pid_max", "r");
-    if (f) {
-        if (fscanf(f, "%d", &pid_max) != 1 || pid_max <= 1) {
-            pid_max = INT32_MAX;
-        }
-        fclose(f);
+    int pid_max;
+    if (buff_read_file(buff, "/proc/sys/kernel/pid_max") <= 0
+        || sscanf(buff->data, "%d", &pid_max) != 1 || pid_max <= 1) {
+        pid_max = INT32_MAX;
     }
     int pid_width = snprintf(NULL, 0, "%d", pid_max - 1);
     if (pid_width < 3) {
@@ -429,24 +420,20 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
         interval = (double)(current->sampled_at.tv_sec - previous->sampled_at.tv_sec)
                    + (current->sampled_at.tv_nsec - previous->sampled_at.tv_nsec) / 1e9;
     }
-    size_t *ancestors = malloc(n * sizeof(*ancestors));
+    size_t *ancestors = malloc(current->n * sizeof(*ancestors));
     if (!ancestors) {
         return -1;
     }
 
-    size_t root = forest_roots(procs, n);
-
     const char *reset = color ? "\033[0m" : "";
     fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
             pid_width, "PID", cpu_width, "%CPU", mem_width, "%MEM", "COMMAND", reset);
-    size_t depth = 0;
-    command_buffer_t buffer = {0};
-    for (size_t cur = root; cur != SIZE_MAX;) {
-        proc_t *proc = &procs[cur];
-        char *command;
+    size_t depth = 0, root = 0;
+    for (size_t cur = nroots ? roots[0] : SIZE_MAX; cur != SIZE_MAX;) {
+        const proc_t *proc = &procs[cur];
         command_name_t name = {0};
-        if (read_cmdline(proc->pid, &buffer, &command, proc->comm, color ? &name : NULL) != 0) {
-            free(buffer.data);
+        int readable = read_cmdline(proc->pid, buff, proc->comm, color ? &name : NULL);
+        if (readable < 0) {
             free(ancestors);
             return -1;
         }
@@ -466,8 +453,8 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
             fputs(" \\_ ", out);
             fputs(reset, out);
         }
-        if (command && *command) {
-            print_command(out, command, name, color);
+        if (readable && *buff->data) {
+            print_command(out, buff->data, name, color);
         } else {
             fputc('[', out);
             print_command(out, proc->comm, (command_name_t){.end = strlen(proc->comm)}, color);
@@ -478,24 +465,29 @@ static int print_forest(FILE *out, snapshot_t *current, const snapshot_t *previo
         if (proc->child != SIZE_MAX) {
             ancestors[depth++] = cur;
             cur = proc->child;
-        } else {
-            while (procs[cur].sibling == SIZE_MAX && depth > 0) {
-                cur = ancestors[--depth];
-            }
+            continue;
+        }
+        while (depth > 0 && procs[cur].sibling == SIZE_MAX) {
+            cur = ancestors[--depth];
+        }
+        if (depth > 0) {
             cur = procs[cur].sibling;
+        } else {
+            /* A root's sibling link belongs to its unselected parent. */
+            cur = ++root < nroots ? roots[root] : SIZE_MAX;
         }
     }
-    free(buffer.data);
     free(ancestors);
     return 0;
 }
 
 /*
- * Link children once, then BFS from all selected roots, selecting each PID once.
- * Lists retain discovery order; tree children are linked in PID order.
+ * Link children, then BFS from the selected processes, selecting each
+ * descendant once. Lists keep scan order; tree siblings are in PID order.
+ * The table must be sorted by sort_procs, as collect_procs returns it.
  */
 static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int color,
-                       const snapshot_t *previous) {
+                       const snapshot_t *previous, buff_t *buff) {
     proc_t *procs = current->procs;
     size_t n = current->n;
     size_t *queue = malloc(n * sizeof(*queue));
@@ -503,31 +495,34 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
         return -1;
     }
 
-    /* Save discovery PIDs before sorting. After linking children, compact the
-     * selected roots into this storage as indices for the BFS queue. */
+    /* Queue every process in output order, then link back to front so that
+     * each child list follows the same order. */
     for (size_t i = 0; i < n; i++) {
-        queue[i] = procs[i].pid;
-    }
-    qsort(procs, n, sizeof(*procs), compare_pid);
-    for (size_t i = 0; i < n; i++) {
-        procs[i].child = procs[i].sibling = SIZE_MAX;
+        queue[tree ? i : procs[i].order] = i;
+        procs[i].child = SIZE_MAX;
     }
     for (size_t i = n; i-- > 0;) {
-        size_t child = tree ? i : find_proc(procs, n, (pid_t)queue[i]);
+        size_t child = queue[i];
         size_t parent = find_proc(procs, n, procs[child].ppid);
-        if (parent != SIZE_MAX && parent != child) {
+        if (parent == child) {
+            parent = SIZE_MAX;
+        }
+        procs[child].parent = parent;
+        procs[child].sibling = SIZE_MAX;
+        if (parent != SIZE_MAX) {
             procs[child].sibling = procs[parent].child;
             procs[parent].child = child;
         }
     }
 
+    /* Keep the matched processes at the front and append their descendants. */
     size_t head = 0, tail = 0;
     for (size_t i = 0; i < n; i++) {
-        size_t index = find_proc(procs, n, (pid_t)queue[i]);
-        if (procs[index].selected) {
-            queue[tail++] = index;
+        if (procs[queue[i]].selected) {
+            queue[tail++] = queue[i];
         }
     }
+    size_t matched = tail;
     while (head < tail) {
         size_t cur = queue[head++];
         for (size_t child = procs[cur].child; child != SIZE_MAX;
@@ -538,7 +533,20 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
             }
         }
     }
-    if (!tree) {
+
+    int result = 0;
+    if (tree) {
+        /* Of the processes matched up front, those whose parent is absent or
+         * unselected are the roots of the displayed forest. */
+        size_t nroots = 0;
+        for (size_t i = 0; i < matched; i++) {
+            size_t parent = procs[queue[i]].parent;
+            if (parent == SIZE_MAX || !procs[parent].selected) {
+                queue[nroots++] = queue[i];
+            }
+        }
+        result = print_forest(out, current, previous, queue, nroots, color, buff);
+    } else {
         int printed = 0;
         for (size_t i = 0; i < tail; i++) {
             print_pid(out, procs[queue[i]].pid, comma, &printed);
@@ -548,7 +556,7 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
         }
     }
     free(queue);
-    return tree ? print_forest(out, current, previous, color) : 0;
+    return result;
 }
 
 /* On PARSE_OK, the caller must free filter if use_filter is set. */
@@ -640,10 +648,11 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
     return PARSE_OK;
 }
 
-static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previous) {
+static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previous,
+                          buff_t *buff) {
     snapshot_t current = {0};
     int result = collect_procs(&current.procs, &current.n, inputs->root,
-                              inputs->use_filter ? &inputs->filter : NULL);
+                              inputs->use_filter ? &inputs->filter : NULL, buff);
     if (result != 0) {
         perror("collect_procs");
         return 1;
@@ -667,16 +676,13 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
         }
         result = inputs->watch ? 0 : 1;
     } else {
-        result = print_trees(out, &current, inputs->comma, inputs->tree, inputs->color, previous);
+        result = print_trees(out, &current, inputs->comma, inputs->tree, inputs->color,
+                             previous, buff);
         if (result != 0) {
             perror("print_trees");
         }
     }
     if (previous) {
-        /* Traversal sorts nonempty frames; retain sorted empty ones too. */
-        if (!found) {
-            qsort(current.procs, current.n, sizeof(*current.procs), compare_pid);
-        }
         free(previous->procs);
         *previous = current;
     } else {
@@ -756,9 +762,9 @@ static void redraw(const char *frame, int color, locale_t display_locale) {
 }
 
 static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous,
-                   locale_t display_locale) {
+                   locale_t display_locale, buff_t *buff) {
     if (!terminal) {
-        return print_snapshot(inputs, stdout, previous);
+        return print_snapshot(inputs, stdout, previous, buff);
     }
 
     char *frame = NULL;
@@ -768,7 +774,7 @@ static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous,
         perror("open_memstream");
         return 1;
     }
-    int result = print_snapshot(inputs, out, previous);
+    int result = print_snapshot(inputs, out, previous, buff);
     if (fclose(out) != 0) {
         perror("fclose");
         result = 1;
@@ -806,10 +812,12 @@ int main(int argc, char **argv) {
         display_locale = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
     }
     snapshot_t previous = {0};
+    buff_t buff = {0}; /* scratch for every /proc read, reused across frames */
     int result;
     do {
         result = refresh(&inputs, inputs.watch && terminal,
-                         inputs.watch && inputs.tree ? &previous : NULL, display_locale);
+                         inputs.watch && inputs.tree ? &previous : NULL, display_locale,
+                         &buff);
         if (fflush(stdout) != 0) {
             perror("stdout");
             result = 1;
@@ -829,6 +837,7 @@ int main(int argc, char **argv) {
     } while (result == 0);
 
     free(previous.procs);
+    free(buff.data);
     if (display_locale) {
         freelocale(display_locale);
     }
