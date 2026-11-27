@@ -11,12 +11,15 @@ SOURCE = r'''
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
 static pid_t fixture_getpid(void);
 static int fixture_scan;
 static int fixture_commands;
+static int fixture_oom;
+static void *fixture_realloc(void *data, size_t size);
 static DIR *fixture_opendir(const char *path);
 static struct dirent *fixture_readdir(DIR *dir);
 static int fixture_closedir(DIR *dir);
@@ -28,15 +31,21 @@ static long fixture_sysconf(int name);
 #define closedir fixture_closedir
 #define open fixture_open
 #define sysconf fixture_sysconf
+#define realloc fixture_realloc
 #define main ptree_main
 #include "ptree.c"
 #undef main
+#undef realloc
 #undef open
 #undef sysconf
 #undef opendir
 #undef readdir
 #undef closedir
 #undef getpid
+
+static void *fixture_realloc(void *data, size_t size) {
+    return fixture_oom ? NULL : realloc(data, size);
+}
 
 static pid_t fixture_getpid(void) {
     return 1000000; /* The harness is outside the synthetic process table. */
@@ -152,6 +161,12 @@ static int run(int argc, char **argv, buff_t *buff) {
         strcpy(procs[i].comm, "process");
     }
     snapshot_t current = {.procs = procs, .n = n, .sampled_at = {.tv_sec = 10}};
+    if (strcmp(argv[1], "oom") == 0) {
+        fixture_scan = 1;
+        fixture_oom = 1;
+        cli_opts_t inputs = {.root = 10, .tree = 1};
+        return print_snapshot(&inputs, stdout, NULL, buff);
+    }
     if (strcmp(argv[1], "duplicates") == 0) {
         proc_t repeated[] = {
             {.pid = 20, .ppid = 10}, {.pid = 10, .selected = 1},
@@ -286,6 +301,13 @@ class SnapshotTests(unittest.TestCase):
                          "     20   0.0   0.0 []\n"
                          "     50   0.0   0.0  \\_ []\n"
                          "     40   0.0   0.0 []\n")
+
+    def test_out_of_memory_stops_with_status_one(self):
+        """Report an allocation failure and exit with status 1"""
+        result = subprocess.run([str(self.binary), "oom"], capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"ptree: out of memory\n")
 
     def cpu_values(self, mode):
         return [float(line.split()[1]) for line in self.run_snapshot(mode).splitlines()[1:]]

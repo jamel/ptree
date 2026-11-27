@@ -44,6 +44,7 @@ typedef struct {
 typedef struct {
     proc_t *procs;
     size_t n;
+    size_t matched; /* processes the scan selected */
     struct timespec sampled_at;
 } snapshot_t;
 
@@ -76,28 +77,32 @@ typedef enum {
 
 /* --- Growable buffer ---------------------------------------------------- */
 
+/* Running out of memory is not recoverable here: report it and stop. */
+static void *xrealloc(void *data, size_t size) {
+    data = realloc(data, size);
+    if (!data) {
+        fputs("ptree: out of memory\n", stderr);
+        exit(1);
+    }
+    return data;
+}
+
 /* Make room for at least size bytes, doubling so repeated growth stays cheap. */
-static int buff_reserve(buff_t *buff, size_t size) {
+static void buff_reserve(buff_t *buff, size_t size) {
     if (size <= buff->cap) {
-        return 0;
+        return;
     }
     size_t cap = buff->cap ? buff->cap : 4096;
     while (cap < size) {
         cap *= 2;
     }
-    char *data = realloc(buff->data, cap);
-    if (!data) {
-        return -1;
-    }
-    buff->data = data;
+    buff->data = xrealloc(buff->data, cap);
     buff->cap = cap;
-    return 0;
 }
 
 /*
- * Replace the contents with the whole file, NUL-terminated. Returns 1 when
- * read, 0 when the file is missing or unreadable, -1 on allocation failure;
- * errno then describes the failure.
+ * Replace the contents with the whole file, NUL-terminated. Returns whether
+ * the file could be read; errno describes a failure.
  */
 static int buff_read_file(buff_t *buff, const char *path) {
     int fd = open(path, O_RDONLY);
@@ -105,16 +110,12 @@ static int buff_read_file(buff_t *buff, const char *path) {
         return 0;
     }
 
-    int result;
+    ssize_t count;
     buff->len = 0;
     for (;;) {
-        if (buff_reserve(buff, buff->len + 2) != 0) { /* one byte and the NUL */
-            result = -1;
-            break;
-        }
-        ssize_t count = read(fd, buff->data + buff->len, buff->cap - buff->len - 1);
+        buff_reserve(buff, buff->len + 2); /* one byte and the NUL */
+        count = read(fd, buff->data + buff->len, buff->cap - buff->len - 1);
         if (count <= 0) {
-            result = count == 0;
             break;
         }
         buff->len += (size_t)count;
@@ -122,17 +123,15 @@ static int buff_read_file(buff_t *buff, const char *path) {
     int error = errno;
     close(fd);
     errno = error;
-    if (result > 0) {
-        buff->data[buff->len] = '\0';
-    }
-    return result;
+    buff->data[buff->len] = '\0';
+    return count == 0;
 }
 
 /* --- Scanning /proc ----------------------------------------------------- */
 
 /*
  * Read the parent, CPU times, resident pages, and name from /proc/<pid>/stat.
- * Returns 1 when parsed, 0 when the process is gone, -1 on allocation failure.
+ * Returns whether the process was there to read.
  *
  * The "stat" file has the form:
  *   <pid> (<comm>) <state> <ppid> ...
@@ -142,9 +141,8 @@ static int buff_read_file(buff_t *buff, const char *path) {
 static int read_stat(pid_t pid, proc_t *proc, buff_t *buff) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-    int readable = buff_read_file(buff, path);
-    if (readable <= 0) {
-        return readable;
+    if (!buff_read_file(buff, path)) {
+        return 0;
     }
 
     char *lparen = strchr(buff->data, '(');
@@ -183,17 +181,16 @@ static int is_all_digits(const char *s) {
     return 1;
 }
 
-/* Read a command line into buff with its arguments joined by spaces. Returns 1
- * when read, 0 when unreadable, -1 on allocation failure. */
+/* Read a command line into buff with its arguments joined by spaces. Returns
+ * whether it could be read. */
 static int read_cmdline(pid_t pid, buff_t *buff, const char *comm, command_name_t *name) {
     if (name) {
         *name = (command_name_t){0};
     }
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
-    int readable = buff_read_file(buff, path);
-    if (readable <= 0) {
-        return readable;
+    if (!buff_read_file(buff, path)) {
+        return 0;
     }
     char *cmdline = buff->data;
     size_t n = buff->len;
@@ -235,13 +232,10 @@ static int read_cmdline(pid_t pid, buff_t *buff, const char *comm, command_name_
     return 1;
 }
 
-/* Return 1 for a match, 0 for unreadable/empty command lines, -1 on allocation failure. */
+/* Unreadable and empty command lines never match. */
 static int matches_filter(pid_t pid, const regex_t *filter, buff_t *buff) {
-    int readable = read_cmdline(pid, buff, NULL, NULL);
-    if (readable <= 0) {
-        return readable;
-    }
-    return *buff->data && regexec(filter, buff->data, 0, NULL, 0) == 0;
+    return read_cmdline(pid, buff, NULL, NULL) && *buff->data
+           && regexec(filter, buff->data, 0, NULL, 0) == 0;
 }
 
 static int compare_pid(const void *a, const void *b) {
@@ -261,50 +255,43 @@ static void sort_procs(proc_t *procs, size_t n) {
 }
 
 /* Scan /proc into a table sorted by PID, selecting the root or filter matches. */
-static int collect_procs(proc_t **out, size_t *out_n, pid_t root, const regex_t *filter,
-                         buff_t *buff) {
+static int collect_procs(snapshot_t *out, pid_t root, const regex_t *filter, buff_t *buff) {
     DIR *d = opendir("/proc");
     if (!d) {
         return -1;
     }
 
     buff_t table = {0};
-    size_t n = 0;
+    size_t n = 0, matched = 0;
     pid_t self = getpid();
-    int status = 0;
     struct dirent *e;
-    while (status >= 0 && (e = readdir(d)) != NULL) {
+    while ((e = readdir(d)) != NULL) {
         if (!is_all_digits(e->d_name)) {
             continue;
         }
 
         pid_t pid = (pid_t)atoi(e->d_name);
-        status = buff_reserve(&table, (n + 1) * sizeof(proc_t));
-        if (status < 0) {
-            break;
-        }
+        buff_reserve(&table, (n + 1) * sizeof(proc_t));
         proc_t *proc = (proc_t *)table.data + n;
         *proc = (proc_t){0};
-        status = read_stat(pid, proc, buff);
-        if (status <= 0) {
-            continue; /* process gone: skip it; an allocation failure ends the scan */
+        if (!read_stat(pid, proc, buff)) {
+            continue; /* process gone, skip */
         }
-        if (!filter) {
+        if (filter) {
+            /* ptree's own arguments contain the pattern. */
+            proc->selected = pid != self && matches_filter(pid, filter, buff);
+        } else {
             proc->selected = pid == root;
-        } else if (pid != self) { /* ptree's own arguments contain the pattern */
-            status = proc->selected = matches_filter(pid, filter, buff);
         }
+        matched += (size_t)proc->selected;
         n++;
     }
     closedir(d);
-    if (status < 0) {
-        free(table.data);
-        return -1;
-    }
 
     sort_procs((proc_t *)table.data, n);
-    *out = (proc_t *)table.data;
-    *out_n = n;
+    out->procs = (proc_t *)table.data;
+    out->n = n;
+    out->matched = matched;
     return 0;
 }
 
@@ -398,7 +385,7 @@ static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *
                         const size_t *roots, size_t nroots, int color, buff_t *buff) {
     const proc_t *procs = current->procs;
     double uptime;
-    if (buff_read_file(buff, "/proc/uptime") <= 0) {
+    if (!buff_read_file(buff, "/proc/uptime")) {
         return -1;
     }
     int parsed = sscanf(buff->data, "%lf", &uptime);
@@ -412,7 +399,7 @@ static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *
 
     /* pid_max is the allocation wrap value; use the PID type's limit if hidden. */
     int pid_max;
-    if (buff_read_file(buff, "/proc/sys/kernel/pid_max") <= 0
+    if (!buff_read_file(buff, "/proc/sys/kernel/pid_max")
         || sscanf(buff->data, "%d", &pid_max) != 1 || pid_max <= 1) {
         pid_max = INT32_MAX;
     }
@@ -428,10 +415,7 @@ static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *
         interval = (double)(current->sampled_at.tv_sec - previous->sampled_at.tv_sec)
                    + (current->sampled_at.tv_nsec - previous->sampled_at.tv_nsec) / 1e9;
     }
-    size_t *ancestors = malloc(current->n * sizeof(*ancestors));
-    if (!ancestors) {
-        return -1;
-    }
+    size_t *ancestors = xrealloc(NULL, current->n * sizeof(*ancestors));
 
     const char *reset = color ? "\033[0m" : "";
     fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
@@ -441,10 +425,6 @@ static int print_forest(FILE *out, const snapshot_t *current, const snapshot_t *
         const proc_t *proc = &procs[cur];
         command_name_t name = {0};
         int readable = read_cmdline(proc->pid, buff, proc->comm, color ? &name : NULL);
-        if (readable < 0) {
-            free(ancestors);
-            return -1;
-        }
         double cpu = cpu_usage(proc, previous, ticks, uptime, interval);
         double mem = proc->rss > 0 ? 100.0 * proc->rss / pages : 0;
         fprintf(out, "%s%*d%s %s%*.1f%s %s%*.1f%s ",
@@ -498,10 +478,7 @@ static int print_trees(FILE *out, snapshot_t *current, int comma, int tree, int 
                        const snapshot_t *previous, buff_t *buff) {
     proc_t *procs = current->procs;
     size_t n = current->n;
-    size_t *queue = malloc(n * sizeof(*queue));
-    if (!queue) {
-        return -1;
-    }
+    size_t *queue = xrealloc(NULL, n * sizeof(*queue));
 
     /* Queue every process in output order, then link back to front so that
      * each child list follows the same order. */
@@ -663,8 +640,8 @@ static parse_result_t parse_opts(int argc, char **argv, cli_opts_t *inputs) {
 static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previous,
                           buff_t *buff) {
     snapshot_t current = {0};
-    int result = collect_procs(&current.procs, &current.n, inputs->root,
-                              inputs->use_filter ? &inputs->filter : NULL, buff);
+    int result = collect_procs(&current, inputs->root,
+                               inputs->use_filter ? &inputs->filter : NULL, buff);
     if (result != 0) {
         perror("collect_procs");
         return 1;
@@ -675,14 +652,7 @@ static int print_snapshot(const cli_opts_t *inputs, FILE *out, snapshot_t *previ
         return 1;
     }
 
-    int found = 0;
-    for (size_t i = 0; i < current.n; i++) {
-        if (current.procs[i].selected) {
-            found = 1;
-            break;
-        }
-    }
-    if (!found) {
+    if (!current.matched) {
         if (!inputs->watch && !inputs->use_filter) {
             fprintf(stderr, "pid %d not found\n", (int)inputs->root);
         }
