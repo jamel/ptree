@@ -51,6 +51,8 @@ int main(int argc, char **argv) {
     proc_t self = {0};
     buff_t buff = {0};
     if (read_stat(getpid(), &self, &buff) != 1) return 1;
+    cli_opts_t inputs = {.format = strcmp(mode, "list") == 0 ? FORMAT_LINES : FORMAT_TREE};
+    if (read_system(&inputs, &buff) != 0) return 1;
     int commands = strcmp(mode, "commands") == 0 || strcmp(mode, "commands-color") == 0;
     int display = strcmp(mode, "redraw") == 0;
     if (display && !freopen("/dev/null", "w", stdout)) return 1;
@@ -74,7 +76,6 @@ int main(int argc, char **argv) {
     } else if (strcmp(mode, "list") == 0 || strcmp(mode, "tree") == 0 ||
                strcmp(mode, "watch") == 0) {
         sort_procs(procs, n);
-        cli_opts_t inputs = {.format = strcmp(mode, "list") == 0 ? FORMAT_LINES : FORMAT_TREE};
         result = print_trees(sink, &inputs, &current,
                              strcmp(mode, "watch") == 0 ? &previous : NULL, &buff);
     } else {

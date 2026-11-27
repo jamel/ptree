@@ -72,6 +72,9 @@ typedef struct {
     regex_t filter;
     int watch;
     struct timespec interval;
+    /* System values for tree output, read once per run by read_system. */
+    long ticks, pages;
+    int pid_width, cpu_width, mem_width;
 } cli_opts_t;
 
 typedef enum {
@@ -395,27 +398,10 @@ static int print_forest(FILE *out, const cli_opts_t *inputs, const snapshot_t *c
     if (!buff_read_file(buff, "/proc/uptime")) {
         return -1;
     }
-    int parsed = sscanf(buff->data, "%lf", &uptime);
-    long ticks = sysconf(_SC_CLK_TCK);
-    long pages = sysconf(_SC_PHYS_PAGES);
-    long ncores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (parsed != 1 || ticks <= 0 || pages <= 0 || ncores <= 0) {
+    if (sscanf(buff->data, "%lf", &uptime) != 1) {
         errno = EIO;
         return -1;
     }
-
-    /* pid_max is the allocation wrap value; use the PID type's limit if hidden. */
-    int pid_max;
-    if (!buff_read_file(buff, "/proc/sys/kernel/pid_max")
-        || sscanf(buff->data, "%d", &pid_max) != 1 || pid_max <= 1) {
-        pid_max = INT32_MAX;
-    }
-    int pid_width = snprintf(NULL, 0, "%d", pid_max - 1);
-    if (pid_width < 3) {
-        pid_width = 3;
-    }
-    int cpu_width = snprintf(NULL, 0, "%.1f", ncores * 100.0);
-    int mem_width = snprintf(NULL, 0, "%.1f", 100.0);
 
     double interval = 0;
     if (previous && previous->procs) {
@@ -426,18 +412,19 @@ static int print_forest(FILE *out, const cli_opts_t *inputs, const snapshot_t *c
 
     const char *reset = color ? "\033[0m" : "";
     fprintf(out, "%s%*s %*s %*s %s%s\n", color ? "\033[1m" : "",
-            pid_width, "PID", cpu_width, "%CPU", mem_width, "%MEM", "COMMAND", reset);
+            inputs->pid_width, "PID", inputs->cpu_width, "%CPU", inputs->mem_width, "%MEM",
+            "COMMAND", reset);
     size_t depth = 0, root = 0;
     for (size_t cur = nroots ? roots[0] : SIZE_MAX; cur != SIZE_MAX;) {
         const proc_t *proc = &procs[cur];
         command_name_t name = {0};
         int readable = read_cmdline(proc->pid, buff, proc->comm, color ? &name : NULL);
-        double cpu = cpu_usage(proc, previous, ticks, uptime, interval);
-        double mem = proc->rss > 0 ? 100.0 * proc->rss / pages : 0;
+        double cpu = cpu_usage(proc, previous, inputs->ticks, uptime, interval);
+        double mem = proc->rss > 0 ? 100.0 * proc->rss / inputs->pages : 0;
         fprintf(out, "%s%*d%s %s%*.1f%s %s%*.1f%s ",
-                color ? "\033[36m" : "", pid_width, (int)proc->pid, reset,
-                color ? usage_color(cpu, 50, 90) : "", cpu_width, cpu, reset,
-                color ? usage_color(mem, 10, 25) : "", mem_width, mem, reset);
+                color ? "\033[36m" : "", inputs->pid_width, (int)proc->pid, reset,
+                color ? usage_color(cpu, 50, 90) : "", inputs->cpu_width, cpu, reset,
+                color ? usage_color(mem, 10, 25) : "", inputs->mem_width, mem, reset);
         if (color && depth) {
             fputs("\033[2m", out);
         }
@@ -778,6 +765,31 @@ static int refresh(const cli_opts_t *inputs, int terminal, snapshot_t *previous,
     return result;
 }
 
+/* Read the system values that tree output uses for the whole run. */
+static int read_system(cli_opts_t *inputs, buff_t *buff) {
+    inputs->ticks = sysconf(_SC_CLK_TCK);
+    inputs->pages = sysconf(_SC_PHYS_PAGES);
+    long ncores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (inputs->ticks <= 0 || inputs->pages <= 0 || ncores <= 0) {
+        errno = EIO;
+        return -1;
+    }
+
+    /* pid_max is the allocation wrap value; use the PID type's limit if hidden. */
+    int pid_max;
+    if (!buff_read_file(buff, "/proc/sys/kernel/pid_max")
+        || sscanf(buff->data, "%d", &pid_max) != 1 || pid_max <= 1) {
+        pid_max = INT32_MAX;
+    }
+    inputs->pid_width = snprintf(NULL, 0, "%d", pid_max - 1);
+    if (inputs->pid_width < 3) {
+        inputs->pid_width = 3;
+    }
+    inputs->cpu_width = snprintf(NULL, 0, "%.1f", ncores * 100.0);
+    inputs->mem_width = snprintf(NULL, 0, "%.1f", 100.0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     cli_opts_t inputs;
     parse_result_t parsed = parse_opts(argc, argv, &inputs);
@@ -805,8 +817,12 @@ int main(int argc, char **argv) {
     }
     snapshot_t previous = {0};
     buff_t buff = {0}; /* scratch for every /proc read, reused across frames */
-    int result;
-    do {
+    int result = 0;
+    if (inputs.format == FORMAT_TREE && read_system(&inputs, &buff) != 0) {
+        perror("read_system");
+        result = 1;
+    }
+    while (result == 0) {
         result = refresh(&inputs, inputs.watch && terminal,
                          inputs.watch && inputs.format == FORMAT_TREE ? &previous : NULL,
                          display_locale, &buff);
@@ -826,7 +842,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-    } while (result == 0);
+    }
 
     free(previous.procs);
     free(buff.data);

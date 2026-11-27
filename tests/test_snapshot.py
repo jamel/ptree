@@ -19,6 +19,7 @@ static pid_t fixture_getpid(void);
 static int fixture_scan;
 static int fixture_commands;
 static int fixture_oom;
+static int fixture_limit_reads;
 static void *fixture_realloc(void *data, size_t size);
 static DIR *fixture_opendir(const char *path);
 static struct dirent *fixture_readdir(DIR *dir);
@@ -85,7 +86,10 @@ static int fixture_open(const char *path, int flags) {
     static const char limit[] = "4194304\n";
     (void)flags;
     if (strcmp(path, "/proc/uptime") == 0) return fixture_file(uptime, sizeof(uptime) - 1);
-    if (strcmp(path, "/proc/sys/kernel/pid_max") == 0) return fixture_file(limit, sizeof(limit) - 1);
+    if (strcmp(path, "/proc/sys/kernel/pid_max") == 0) {
+        fixture_limit_reads++;
+        return fixture_file(limit, sizeof(limit) - 1);
+    }
     if (fixture_commands && strstr(path, "/cmdline")) {
         static char long_command[5006];
         static const char short_command[] = "short";
@@ -163,10 +167,12 @@ static int run(int argc, char **argv, buff_t *buff) {
     snapshot_t current = {.procs = procs, .n = n, .sampled_at = {.tv_sec = 10}};
     cli_opts_t tree = {.format = FORMAT_TREE}, lines = {.format = FORMAT_LINES};
     cli_opts_t comma = {.format = FORMAT_COMMA};
+    if (read_system(&tree, buff) != 0) return 2;
     if (strcmp(argv[1], "oom") == 0) {
         fixture_scan = 1;
         fixture_oom = 1;
-        cli_opts_t inputs = {.root = 10};
+        cli_opts_t inputs = tree;
+        inputs.root = 10;
         return print_snapshot(&inputs, stdout, NULL, buff);
     }
     if (strcmp(argv[1], "duplicates") == 0) {
@@ -188,11 +194,19 @@ static int run(int argc, char **argv, buff_t *buff) {
         return print_trees(stdout, &tree, &scan, NULL, buff);
     }
     /* Hand-built tables stand in for a scan, so sort them as collect_procs does. */
+    if (strcmp(argv[1], "system-once") == 0) {
+        sort_procs(procs, n);
+        if (print_trees(stdout, &tree, &current, NULL, buff) != 0) return 1;
+        if (print_trees(stdout, &tree, &current, NULL, buff) != 0) return 1;
+        printf("pid_max reads: %d\n", fixture_limit_reads);
+        return 0;
+    }
     if (strncmp(argv[1], "commands", 8) == 0) {
         fixture_commands = 1;
         if (strcmp(argv[1], "commands-filter") == 0) {
             fixture_scan = 1;
-            cli_opts_t inputs = {.use_filter = 1};
+            cli_opts_t inputs = tree;
+            inputs.use_filter = 1;
             if (regcomp(&inputs.filter, "^short$", REG_EXTENDED | REG_NOSUB) != 0) return 2;
             int result = print_snapshot(&inputs, stdout, NULL, buff);
             regfree(&inputs.filter);
@@ -229,7 +243,9 @@ static int run(int argc, char **argv, buff_t *buff) {
         if (strcmp(argv[1], "cpu-after-empty-frame") == 0) {
             fixture_scan = 1;
             snapshot_t empty = {0};
-            cli_opts_t inputs = {.root = 999, .watch = 1};
+            cli_opts_t inputs = tree;
+            inputs.root = 999;
+            inputs.watch = 1;
             if (print_snapshot(&inputs, stdout, &empty, buff) != 0) return 1;
             empty.sampled_at.tv_sec = 9;
             empty.sampled_at.tv_nsec = 0;
@@ -311,6 +327,10 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"ptree: out of memory\n")
+
+    def test_system_values_are_read_once_per_run(self):
+        """Read pid_max once for all the frames of a run"""
+        self.assertEqual(self.run_snapshot("system-once").splitlines()[-1], "pid_max reads: 1")
 
     def cpu_values(self, mode):
         return [float(line.split()[1]) for line in self.run_snapshot(mode).splitlines()[1:]]

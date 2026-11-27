@@ -192,6 +192,7 @@ int main(int argc, char **argv) {
     snapshot_t current = {.procs = &proc, .n = 1, .sampled_at = {.tv_sec = 101}};
     buff_t buff = {0};
     cli_opts_t inputs = {.format = FORMAT_TREE, .color = 1};
+    if (read_system(&inputs, &buff) != 0) return 2;
     int result = print_trees(stdout, &inputs, &current, &previous, &buff);
     free(buff.data);
     return result;

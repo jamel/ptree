@@ -18,8 +18,9 @@ pass/fail test; host load affects it.
   Synthetic PIDs start at 100000000; the benchmark fails their command opens
   without a syscall, so rows exercise the name fallback and no `/proc` lookup
   is timed. `/proc` collection and real command reading are excluded; rendering
-  still reads real system metadata. These are phase timings, not end-to-end
-  process-monitor performance.
+  still reads the real uptime, and the other system values are read before
+  the timer starts. These are phase timings, not end-to-end process-monitor
+  performance.
 - `commands`, `commands-color`: read the benchmark's actual command line N
   times, including an 8 KiB argument, without/with command-name extraction.
 - `redraw`: redraw N small styled Unicode frames to `/dev/null`, including
