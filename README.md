@@ -43,3 +43,16 @@ ps -o pid,ppid,user,stat,etime,%cpu,%mem,args --forest -p "$(ptree -c -p 1234)"
 ```
 
 `ptree --help` lists the rest.
+
+## Development
+
+```sh
+make         # build
+make test    # run the tests (needs Python 3)
+make bench   # run the benchmarks (needs Python 3)
+make fmt     # format the code in Linux kernel style (needs clang-format)
+make clean   # remove build output
+```
+
+More on benchmarks in [bench/README.md](bench/README.md). To use a specific
+clang-format, run `make fmt CLANG_FORMAT=clang-format-20`.
