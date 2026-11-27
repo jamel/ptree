@@ -3,7 +3,7 @@
 Shows a process and everything it started as a tree, with PID, CPU, memory,
 and the full command line. Linux only.
 
-![ptree showing a demo server and three worker processes](docs/ptree.png)
+![ptree showing compiler processes during a Linux kernel build](docs/ptree.png)
 
 ## Why
 
